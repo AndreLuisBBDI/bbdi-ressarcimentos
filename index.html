@@ -1322,7 +1322,7 @@ const Permissions = {
   // também no servidor pelas políticas. O PIN só existe no modo local.
   adminOk() { return SB.ativo() ? !!(Session.atual && Session.atual.admin) : sessionStorage.getItem(APP.prefixo + 'admin') === '1'; },
   exigePin() { return !SB.ativo(); },
-  desbloquear(pin) { if (SB.ativo()) return false; /* na nuvem quem manda e a coluna admin */
+  desbloquear(pin) { if (SB.ativo()) return false; /* na nuvem quem manda é a coluna admin */
     if (String(pin) === String(Store.settings.adminPin)) { sessionStorage.setItem(APP.prefixo + 'admin', '1'); return true; } return false; },
   bloquear() { sessionStorage.removeItem(APP.prefixo + 'admin'); },
 };
@@ -2737,21 +2737,21 @@ const Nav = {
     document.getElementById('mainTabs').addEventListener('click', e => { const t = e.target.closest('[data-view]'); if (t) this.show(t.dataset.view); });
   },
   show(view) {
-    // Na nuvem quem guarda a area e a coluna admin. No modo local nao ha conta:
-    // a aba continua aberta porque e nela que se digita o PIN.
-    if (view === 'configuracoes' && SB.ativo() && !Permissions.adminOk()) { Toast.show('As configuracoes sao exclusivas do administrador.', 'error'); return; }
+    // Na nuvem quem guarda a área é a coluna admin. No modo local não há conta:
+    // a aba continua aberta porque é nela que se digita o PIN.
+    if (view === 'configuracoes' && SB.ativo() && !Permissions.adminOk()) { Toast.show('As configurações são exclusivas do administrador.', 'error'); return; }
     if (view === 'dashboard' && !Permissions.can('dashboard')) { Toast.show('Seu setor não tem acesso ao dashboard.', 'error'); return; }
     if (view === 'logs' && !Permissions.can('verLogs')) { Toast.show('Seu setor não tem acesso aos logs de auditoria.', 'error'); return; }
     if (view === 'relatorios' && !Permissions.can('exportar')) { Toast.show('Seu setor não tem permissão para exportar relatórios.', 'error'); return; }
     this.atual = view;
     this.sincronizarAbas();
-    U.$('#mainTabs .tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    U.$$('#mainTabs .tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
     U.$$('.view').forEach(v => v.classList.toggle('active', v.dataset.view === view));
     Store.savePrefs({ ultimaAba: view });
     const v = this.views[view]; if (v && v.render) v.render();
     window.scrollTo({ top: 0 });
   },
-  // Aba que a pessoa nao pode abrir nao fica na barra chamando para o erro.
+  // Aba que a pessoa não pode abrir não fica na barra chamando para o erro.
   sincronizarAbas() {
     const regra = {
       dashboard:     () => Permissions.can('dashboard'),
@@ -2759,7 +2759,7 @@ const Nav = {
       relatorios:    () => Permissions.can('exportar'),
       configuracoes: () => !SB.ativo() || Permissions.adminOk(),
     };
-    U.$('#mainTabs .tab').forEach(b => { const r = regra[b.dataset.view]; b.hidden = !!r && !r(); });
+    U.$$('#mainTabs .tab').forEach(b => { const r = regra[b.dataset.view]; b.hidden = !!r && !r(); });
   },
   refresh() { this.show(this.atual); },
 };
@@ -2965,13 +2965,13 @@ const ConfigView = {
   render() { if (Permissions.adminOk()) this.renderPanel(); else this.renderGate(); },
   renderGate() {
     const root = document.getElementById('configContent');
-    // Com login e senha nao existe PIN que valha: quem manda e a coluna admin,
+    // Com login e senha não existe PIN que valha: quem manda é a coluna admin,
     // e o banco recusa a escrita de qualquer outro (p_settings_upd).
     if (SB.ativo()) {
       const q = Session.atual || {};
-      root.innerHTML = `<div class="card pin-gate card-body"><div class="lock">\u{1F512}</div><h3>Area do administrador</h3>
-        <p class="small muted mt8">Esta aba e exclusiva do administrador. Voce entrou como <b>${U.esc(q.nome || '')}</b>${q.setor ? ' \u00b7 ' + U.esc(q.setor) : ''}.</p>
-        <p class="small muted mt8">Precisa de transportadora nova, ajuste de permissao ou outra configuracao? Fale com o administrador.</p></div>`;
+      root.innerHTML = `<div class="card pin-gate card-body"><div class="lock">\u{1F512}</div><h3>Área do administrador</h3>
+        <p class="small muted mt8">Esta aba é exclusiva do administrador. Você entrou como <b>${U.esc(q.nome || '')}</b>${q.setor ? ' \u00b7 ' + U.esc(q.setor) : ''}.</p>
+        <p class="small muted mt8">Precisa de transportadora nova, ajuste de permissão ou outra configuração? Fale com o administrador.</p></div>`;
       return;
     }
     root.innerHTML = `<div class="card pin-gate card-body"><div class="lock">🔒</div><h3>Área do administrador</h3><p class="small muted mt8">Informe o PIN de administrador para acessar as configurações.</p>
@@ -3046,7 +3046,7 @@ const ConfigView = {
     switch (act) {
       case 'lock': Permissions.bloquear(); this.render(); break;
       case 'save-geral': {
-        const pin = SB.ativo() ? '' : val('cfgPin').trim(); // na nuvem o campo nem e desenhado
+        const pin = SB.ativo() ? '' : val('cfgPin').trim(); // na nuvem o campo nem é desenhado
         const p = { empresa: val('cfgEmpresa').trim(), prefixoNumeracao: (val('cfgPrefixo').trim() || 'RES').toUpperCase(), limiteAlerta: Math.max(0, Number(val('cfgLimite')) || 0), csvSeparador: val('cfgSep'), exigirAssinatura: root.querySelector('#cfgAssin').checked, bloquearNfDuplicada: root.querySelector('#cfgNfDup').checked, simularPresenca: root.querySelector('#cfgSim').checked };
         if (pin) { if (pin.length < 4) { Toast.show('O PIN deve ter pelo menos 4 caracteres.', 'error'); return; } p.adminPin = pin; }
         await this.salvar(p, 'Parâmetros gerais' + (pin ? ' (PIN alterado)' : '')); this.renderPanel(); break;
