@@ -1208,7 +1208,14 @@ const Store = {
   async appendLog(entry) { this.state.logs = await Adapter.upsert('logs', entry); return entry; },
   async saveDraft(carrierId, draft) { this.state.drafts = await Adapter.writeKey('drafts', carrierId, draft); },
   async removeDraft(carrierId) { this.state.drafts = await Adapter.removeKey('drafts', carrierId); },
-  async saveSettings(settings) { this.state.settings = this.mergeSettings(settings); await Adapter.writeAll('settings', this.state.settings); Bus.emit('settings:changed'); },
+  async saveSettings(settings) {
+    this.state.settings = this.mergeSettings(settings);
+    // Na nuvem o PIN não guarda mais nada (quem manda é a coluna admin) e o jsonb
+    // é lido por qualquer usuário ativo: não é lugar de guardar segredo.
+    const paraGravar = SB.ativo() ? (({ adminPin, ...resto }) => resto)(this.state.settings) : this.state.settings;
+    await Adapter.writeAll('settings', paraGravar);
+    Bus.emit('settings:changed');
+  },
   async savePrefs(partial) { this.state.prefs = { ...this.state.prefs, ...partial }; await Adapter.writeAll('prefs', this.state.prefs); },
   /** Sequência anual de numeração. Na nuvem, o servidor deve atribuir o número (evita colisão entre usuários). */
   async nextSequence(ano) {
@@ -1315,7 +1322,8 @@ const Permissions = {
   // também no servidor pelas políticas. O PIN só existe no modo local.
   adminOk() { return SB.ativo() ? !!(Session.atual && Session.atual.admin) : sessionStorage.getItem(APP.prefixo + 'admin') === '1'; },
   exigePin() { return !SB.ativo(); },
-  desbloquear(pin) { if (String(pin) === String(Store.settings.adminPin)) { sessionStorage.setItem(APP.prefixo + 'admin', '1'); return true; } return false; },
+  desbloquear(pin) { if (SB.ativo()) return false; /* na nuvem quem manda e a coluna admin */
+    if (String(pin) === String(Store.settings.adminPin)) { sessionStorage.setItem(APP.prefixo + 'admin', '1'); return true; } return false; },
   bloquear() { sessionStorage.removeItem(APP.prefixo + 'admin'); },
 };
 
@@ -2729,15 +2737,29 @@ const Nav = {
     document.getElementById('mainTabs').addEventListener('click', e => { const t = e.target.closest('[data-view]'); if (t) this.show(t.dataset.view); });
   },
   show(view) {
+    // Na nuvem quem guarda a area e a coluna admin. No modo local nao ha conta:
+    // a aba continua aberta porque e nela que se digita o PIN.
+    if (view === 'configuracoes' && SB.ativo() && !Permissions.adminOk()) { Toast.show('As configuracoes sao exclusivas do administrador.', 'error'); return; }
     if (view === 'dashboard' && !Permissions.can('dashboard')) { Toast.show('Seu setor não tem acesso ao dashboard.', 'error'); return; }
     if (view === 'logs' && !Permissions.can('verLogs')) { Toast.show('Seu setor não tem acesso aos logs de auditoria.', 'error'); return; }
     if (view === 'relatorios' && !Permissions.can('exportar')) { Toast.show('Seu setor não tem permissão para exportar relatórios.', 'error'); return; }
     this.atual = view;
-    U.$$('#mainTabs .tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+    this.sincronizarAbas();
+    U.$('#mainTabs .tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
     U.$$('.view').forEach(v => v.classList.toggle('active', v.dataset.view === view));
     Store.savePrefs({ ultimaAba: view });
     const v = this.views[view]; if (v && v.render) v.render();
     window.scrollTo({ top: 0 });
+  },
+  // Aba que a pessoa nao pode abrir nao fica na barra chamando para o erro.
+  sincronizarAbas() {
+    const regra = {
+      dashboard:     () => Permissions.can('dashboard'),
+      logs:          () => Permissions.can('verLogs'),
+      relatorios:    () => Permissions.can('exportar'),
+      configuracoes: () => !SB.ativo() || Permissions.adminOk(),
+    };
+    U.$('#mainTabs .tab').forEach(b => { const r = regra[b.dataset.view]; b.hidden = !!r && !r(); });
   },
   refresh() { this.show(this.atual); },
 };
@@ -2943,6 +2965,15 @@ const ConfigView = {
   render() { if (Permissions.adminOk()) this.renderPanel(); else this.renderGate(); },
   renderGate() {
     const root = document.getElementById('configContent');
+    // Com login e senha nao existe PIN que valha: quem manda e a coluna admin,
+    // e o banco recusa a escrita de qualquer outro (p_settings_upd).
+    if (SB.ativo()) {
+      const q = Session.atual || {};
+      root.innerHTML = `<div class="card pin-gate card-body"><div class="lock">\u{1F512}</div><h3>Area do administrador</h3>
+        <p class="small muted mt8">Esta aba e exclusiva do administrador. Voce entrou como <b>${U.esc(q.nome || '')}</b>${q.setor ? ' \u00b7 ' + U.esc(q.setor) : ''}.</p>
+        <p class="small muted mt8">Precisa de transportadora nova, ajuste de permissao ou outra configuracao? Fale com o administrador.</p></div>`;
+      return;
+    }
     root.innerHTML = `<div class="card pin-gate card-body"><div class="lock">🔒</div><h3>Área do administrador</h3><p class="small muted mt8">Informe o PIN de administrador para acessar as configurações.</p>
       <form id="pinForm" class="flex mt12" style="justify-content:center"><input class="input" type="password" id="pinInput" placeholder="PIN" inputmode="numeric" autocomplete="off" style="max-width:160px;text-align:center;letter-spacing:4px"><button class="btn btn-primary" type="submit">Entrar</button></form>
       <p class="small muted mt12">PIN inicial: <code>1234</code> — altere-o após o primeiro acesso.</p></div>`;
@@ -2957,7 +2988,7 @@ const ConfigView = {
   renderPanel() {
     const s = Store.settings, e = U.esc, a = U.attr, uso = Adapter.usage(), lim = 5 * 1024 * 1024, snap = Backup.ultimoSnapshot();
     document.getElementById('configContent').innerHTML = `
-      <div class="flex mb12" style="justify-content:flex-end"><button type="button" class="btn btn-secondary btn-sm" data-cfg="lock">Bloquear área admin</button></div>
+      ${SB.ativo() ? '' : '<div class="flex mb12" style="justify-content:flex-end"><button type="button" class="btn btn-secondary btn-sm" data-cfg="lock">Bloquear área admin</button></div>'}
       <div class="cfg-grid">
         <div class="card"><div class="card-head"><h3>Parâmetros gerais</h3></div><div class="card-body">
           <div class="field mb12"><label>Nome da empresa (cabeçalho do PDF e e-mails)</label><input class="input" id="cfgEmpresa" value="${a(s.empresa)}" placeholder="Ex.: Minha Empresa Ltda."></div>
@@ -2965,7 +2996,7 @@ const ConfigView = {
             <div class="field"><label>Prefixo da numeração</label><input class="input" id="cfgPrefixo" value="${a(s.prefixoNumeracao)}" maxlength="6"><span class="hint">Ex.: RES → RES-${new Date().getFullYear()}-0001</span></div>
             <div class="field"><label>Limite de alerta de valor (R$)</label><input class="input" id="cfgLimite" type="number" min="0" step="100" value="${a(s.limiteAlerta)}"><span class="hint">0 desativa o alerta</span></div>
             <div class="field"><label>Separador do CSV</label><select class="select" id="cfgSep"><option value=";" ${s.csvSeparador === ';' ? 'selected' : ''}>; — Excel Brasil</option><option value="," ${s.csvSeparador === ',' ? 'selected' : ''}>, — internacional</option></select><span class="hint">Com ";" o decimal usa vírgula; com "," usa ponto</span></div>
-            <div class="field"><label>Novo PIN de administrador</label><input class="input" id="cfgPin" type="password" placeholder="em branco para manter" autocomplete="new-password"></div>
+            ${SB.ativo() ? '' : '<div class="field"><label>Novo PIN de administrador</label><input class="input" id="cfgPin" type="password" placeholder="em branco para manter" autocomplete="new-password"></div>'}
           </div>
           <div class="mt12"><label class="check"><input type="checkbox" id="cfgNfDup" ${s.bloquearNfDuplicada !== false ? 'checked' : ''}> Barrar nota fiscal já incluída em outro formulário</label></div>
           <div class="mt8"><label class="check"><input type="checkbox" id="cfgAssin" ${s.exigirAssinatura ? 'checked' : ''}> Exigir assinatura desenhada para finalizar${SB.ativo() ? ' <span class="muted">— não se aplica: aqui a assinatura é o login</span>' : ''}</label></div>
@@ -2983,7 +3014,7 @@ const ConfigView = {
         </div></div>
         <div class="card"><div class="card-head"><h3>Permissões por setor</h3></div><div class="card-body">
           <table class="cfg-table perm-table"><thead><tr><th>Ação</th>${SETORES.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${ACOES.map(ac => `<tr><td>${e(ac.label)}</td>${SETORES.map(st => `<td><input type="checkbox" data-perm="${st}:${ac.id}" ${s.permissoes[st] && s.permissoes[st][ac.id] !== false ? 'checked' : ''}></td>`).join('')}</tr>`).join('')}</tbody></table>
-          <p class="small muted mt8">Aplicadas na interface (preparo para a versão online, onde o servidor deve validá-las). Esta área é protegida pelo PIN de administrador.</p>
+          <p class="small muted mt8">${SB.ativo() ? 'Valem na tela e no servidor: solicitar ressarcimento tamb\u00e9m passa pela pol\u00edtica de INSERT. O administrador n\u00e3o fica preso \u00e0 matriz.' : 'Aplicadas na interface. Esta \u00e1rea \u00e9 protegida pelo PIN de administrador.'}</p>
           <div class="right"><button type="button" class="btn btn-primary btn-sm" data-cfg="save-perms">Salvar permissões</button></div>
         </div></div>
         <div class="card" style="grid-column:1/-1"><div class="card-head"><h3>Transportadoras</h3><button type="button" class="btn btn-xs btn-secondary" data-cfg="add-carrier">+ Adicionar</button></div><div class="card-body">
@@ -3015,7 +3046,7 @@ const ConfigView = {
     switch (act) {
       case 'lock': Permissions.bloquear(); this.render(); break;
       case 'save-geral': {
-        const pin = val('cfgPin').trim();
+        const pin = SB.ativo() ? '' : val('cfgPin').trim(); // na nuvem o campo nem e desenhado
         const p = { empresa: val('cfgEmpresa').trim(), prefixoNumeracao: (val('cfgPrefixo').trim() || 'RES').toUpperCase(), limiteAlerta: Math.max(0, Number(val('cfgLimite')) || 0), csvSeparador: val('cfgSep'), exigirAssinatura: root.querySelector('#cfgAssin').checked, bloquearNfDuplicada: root.querySelector('#cfgNfDup').checked, simularPresenca: root.querySelector('#cfgSim').checked };
         if (pin) { if (pin.length < 4) { Toast.show('O PIN deve ter pelo menos 4 caracteres.', 'error'); return; } p.adminPin = pin; }
         await this.salvar(p, 'Parâmetros gerais' + (pin ? ' (PIN alterado)' : '')); this.renderPanel(); break;
@@ -3060,11 +3091,12 @@ const ConfigView = {
         await Backup.aplicar(snap, 'substituir'); await Audit.log('SNAPSHOT_RESTAURADO', { detalhe: U.fmtDateTime(snap.geradoEm) }); Toast.show('Snapshot restaurado.', 'success'); await App.recarregarViews(); break;
       }
       case 'wipe': {
+        // Na nuvem a base é da equipe: nem chega a perguntar, porque este botão
+        // limpa este navegador e não o servidor.
+        if (SB.ativo()) { Toast.show('A base agora é compartilhada — apagar tudo afetaria a equipe inteira. Isso se faz pelo painel do Supabase.', 'warn', 7000); break; }
         const pin = await Modal.prompt({ titulo: 'Apagar todos os dados', tipo: 'password', placeholder: 'PIN', mensagem: '<b>Esta ação é irreversível.</b> Formulários, logs, rascunhos, anexos e configurações serão apagados deste navegador. Exporte um backup antes.<br><br>Digite o PIN de administrador para confirmar:' });
         if (pin === null) return;
         if (String(pin) !== String(Store.settings.adminPin)) { Toast.show('PIN incorreto.', 'error'); return; }
-        // Na nuvem a base é da equipe: o botão limpa este navegador, não o servidor.
-        if (SB.ativo()) { Toast.show('A base agora é compartilhada — apagar tudo afetaria a equipe inteira. Isso se faz pelo painel do Supabase.', 'warn', 7000); break; }
         App.wiping = true; try { await AttachmentStore.clear(); } catch (err) { /* ignora */ } Adapter.clearAll(); localStorage.removeItem(Backup._key); sessionStorage.clear(); location.reload(); break;
       }
     }
