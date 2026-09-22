@@ -1368,6 +1368,13 @@ const Presence = {
     this.heartbeat().then(() => Bus.emit('presence:changed'));
     this._timer = setInterval(() => this.tick(), this.INTERVALO);
     ['click', 'keydown', 'input', 'pointerdown'].forEach(ev => document.addEventListener(ev, () => { this._ultimaAtividade = Date.now(); }, { passive: true }));
+    // Aba em segundo plano tem o timer estrangulado pelo Chrome: volta com heartbeat
+    // vencido e cache velho. Ao reaparecer, bate o ponto e refaz a lista do banco.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      this._reconciliadoEm = 0;
+      this.tick().catch(() => {});
+    });
   },
   /** Push de verdade: o banco avisa a chegada e a saída no instante em que acontecem.
    *  O heartbeat continua porque é ele que derruba quem fecha o notebook sem se despedir. */
