@@ -150,6 +150,16 @@ code{font-family:var(--mono);font-size:.92em}
 .card-head h3{font-size:14px;font-weight:600}
 .section-title{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--ink-3);margin:0 0 10px}
 
+/* Nota fiscal já incluída: aviso na linha e consulta rápida */
+.nf-find{margin-top:14px}
+.nf-find-out{margin-top:8px;max-height:210px;overflow:auto}
+.nf-find-hit{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:6px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;font-size:12.5px}
+.nf-find-empty{font-size:12.5px;padding:6px 2px;opacity:.7}
+.nf-dup{margin-top:4px;font-size:11.5px;line-height:1.3;color:#b4232a}
+.nf-table tr.dup td.col-nf .input{border-color:#b4232a;background:#fff5f5}
+.sig-digital{border:1px dashed var(--border);border-radius:10px;padding:14px 16px}
+.sig-digital .nm{font-size:15px;font-weight:600}
+
 /* Formulários: sidebar de transportadoras + painel */
 .forms-layout{display:grid;grid-template-columns:270px minmax(0,1fr);gap:18px;align-items:start}
 .carrier-list{display:flex;flex-direction:column;gap:2px;padding:8px;max-height:calc(100vh - 120px);overflow:auto;position:sticky;top:76px}
@@ -568,7 +578,7 @@ const STATUS = Object.freeze({ ABERTO: 'Aberto', FINALIZADO: 'Finalizado', CANCE
 const RECONCILIACAO = ['Pendente', 'Confirmado', 'Recusado', 'Pago'];
 const SETORES = ['LOG', 'SAC', 'FIN'];
 const ACOES = [
-  { id: 'formularios', label: 'Abrir e finalizar formulários' },
+  { id: 'formularios', label: 'Solicitar ressarcimento (abrir e finalizar)' },
   { id: 'cancelar',    label: 'Cancelar formulários' },
   { id: 'reconciliar', label: 'Atualizar reconciliação' },
   { id: 'verLogs',     label: 'Ver logs de auditoria' },
@@ -608,6 +618,7 @@ const DEFAULT_TRANSPORTADORAS = [
   { id: 'azul',               nome: 'Azul',                cnpj: '33.814.292/0001-55' },
   { id: 'trd-transportes',    nome: 'TRD Transportes',     cnpj: '05.215.364/0007-06' },
   { id: 'expresso-sao-miguel', nome: 'Expresso São Miguel', cnpj: '00.428.307/0003-50' },
+  { id: 'total-express',      nome: 'Total Express',        cnpj: '73.939.449/0001-93' },
 ].map(t => ({ ...t, email: '', whatsapp: '', ativo: true }));
 
 const DEFAULT_USUARIOS = [
@@ -626,6 +637,7 @@ const DEFAULT_SETTINGS = {
   empresa: '',
   limiteAlerta: 10000,
   exigirAssinatura: false,
+  bloquearNfDuplicada: true,
   prefixoNumeracao: 'RES',
   adminPin: '1234',
   simularPresenca: true,
@@ -633,10 +645,13 @@ const DEFAULT_SETTINGS = {
   usuarios: DEFAULT_USUARIOS,
   filiais: DEFAULT_FILIAIS,
   transportadoras: DEFAULT_TRANSPORTADORAS,
+  // Solicitar ressarcimento é do Financeiro (pedido dele em 22/09/2026). Os demais
+  // setores continuam enxergando tudo — dashboard, logs e relatórios. Quem é
+  // administrador passa por cima desta matriz (ver Permissions.can).
   permissoes: {
-    LOG: { formularios: true, cancelar: true, reconciliar: false, verLogs: true, dashboard: true, exportar: true },
-    SAC: { formularios: true, cancelar: true, reconciliar: false, verLogs: true, dashboard: true, exportar: true },
-    FIN: { formularios: true, cancelar: true, reconciliar: true,  verLogs: true, dashboard: true, exportar: true },
+    LOG: { formularios: false, cancelar: false, reconciliar: false, verLogs: true, dashboard: true, exportar: true },
+    SAC: { formularios: false, cancelar: false, reconciliar: false, verLogs: true, dashboard: true, exportar: true },
+    FIN: { formularios: true,  cancelar: true,  reconciliar: true,  verLogs: true, dashboard: true, exportar: true },
   },
 };
 
@@ -1290,6 +1305,8 @@ const Session = {
 const Permissions = {
   can(acao) {
     const s = Session.atual; if (!s) return false;
+    // O administrador não fica preso à matriz de setor: é ele quem a edita.
+    if (this.adminOk()) return true;
     const p = Store.settings.permissoes && Store.settings.permissoes[s.setor];
     if (!p) return true;
     return p[acao] !== false;
@@ -1563,6 +1580,22 @@ const FormService = {
     const limC = lim * 100;
     return { linhas: d.itens.filter(i => (Number(i.valorCents) || 0) > limC).map(i => i.rid), total: this.totalCents(d) > limC };
   },
+  /** Em que formulários esta nota fiscal já aparece. Cancelado e excluído não ocupam a NF. */
+  ocorrenciasNf(nf, exceptoFormId) {
+    const alvo = String(nf || '').trim().toLowerCase(); if (!alvo) return [];
+    return Store.state.forms.filter(f => !f.excluido && f.status !== STATUS.CANCELADO && f.id !== exceptoFormId
+      && (f.itens || []).some(i => String(i.nf || '').trim().toLowerCase() === alvo));
+  },
+  /** Consulta livre por nota fiscal: devolve pares formulário + item, do mais novo ao mais velho. */
+  buscarNf(texto) {
+    const q = String(texto || '').trim().toLowerCase(); if (q.length < 2) return [];
+    const out = [];
+    Store.state.forms.forEach(f => {
+      if (f.excluido) return;
+      (f.itens || []).forEach(i => { if (String(i.nf || '').trim().toLowerCase().includes(q)) out.push({ form: f, item: i }); });
+    });
+    return out.sort((a, b) => String(b.form.criadoEm || '').localeCompare(String(a.form.criadoEm || ''))).slice(0, 30);
+  },
   validar(d) {
     const erros = [], campos = {};
     if (!d.solicitanteId || !Catalog.usuario(d.solicitanteId)) { erros.push('Selecione o solicitante.'); campos.solicitante = true; }
@@ -1580,7 +1613,18 @@ const FormService = {
     const nfs = preenchidos.map(i => String(i.nf || '').trim()).filter(Boolean);
     const dup = [...new Set(nfs.filter((n, i) => nfs.indexOf(n) !== i))];
     if (dup.length) erros.push(`Nota fiscal repetida no formulário: ${dup.join(', ')}.`);
-    if (Store.settings.exigirAssinatura && !d.assinatura) { erros.push('A assinatura eletrônica do solicitante é obrigatória.'); campos.assinatura = true; }
+    // Nota fiscal que já está em outro formulário. O servidor repete esta checagem
+    // ao finalizar (trigger tg_forms_nfs); aqui é para avisar antes de chegar lá.
+    if (Store.settings.bloquearNfDuplicada !== false) {
+      preenchidos.forEach(i => {
+        const nf = String(i.nf || '').trim(); if (!nf) return;
+        const ja = this.ocorrenciasNf(nf, d.formId); if (!ja.length) return;
+        erros.push(`Nota fiscal ${nf} já foi incluída em ${ja[0].numero} (${ja[0].transportadora} · ${ja[0].status})${ja.length > 1 ? ` e em mais ${ja.length - 1}` : ''}.`);
+        campos['nf:' + i.rid] = true;
+      });
+    }
+    // Na nuvem a assinatura é a própria conta, aplicada ao finalizar: não há o que exigir.
+    if (!SB.ativo() && Store.settings.exigirAssinatura && !d.assinatura) { erros.push('A assinatura eletrônica do solicitante é obrigatória.'); campos.assinatura = true; }
     return { erros, campos };
   },
   /** Cria o registro do formulário (status Aberto) na primeira interação com conteúdo. */
@@ -1628,6 +1672,12 @@ const FormService = {
     Object.assign(form, { solicitanteId: d.solicitanteId, solicitante: u.nome, setor: u.setor, filial: d.filial,
       itens: this.montarItens(d), total: U.centsToReais(this.totalCents(d)), observacoes: (d.observacoes || '').trim(), anexos: d.anexos || [],
       status: STATUS.FINALIZADO, finalizadoEm: agora, finalizadoPor: op });
+    // Assinatura eletrônica: com login por pessoa, quem assina é a conta. O desenho
+    // à mão só continua existindo na versão local, onde não há autenticação de verdade.
+    if (SB.ativo() && Session.atual) {
+      form.assinaturaDigital = { nome: Session.atual.nome, setor: Session.atual.setor || '', email: Session.atual.email || '',
+        authId: Session.authId || '', sessao: String(Session.atual.sessionId || '').slice(0, 8), em: agora };
+    }
     if (d.assinatura) {
       const blob = U.dataUrlToBlob(d.assinatura); const id = U.uuid();
       try { await AttachmentStore.put({ id, formId: form.id, kind: 'assinatura', nome: 'assinatura.png', tipo: 'image/png', tamanho: blob.size, blob, criadoEm: agora }); form.assinaturaId = id; }
@@ -1785,12 +1835,21 @@ const PdfService = {
       y += 6 + form.anexos.length * 4.3;
     }
     const sig = await this._assinaturaDataUrl(form);
+    const ad = form.assinaturaDigital || null;
     y = this._quebra(doc, y + 6, 40);
     if (sig) { try { doc.addImage(sig, 'PNG', M, y, 60, 20); } catch (e) { console.warn('assinatura não incorporada', e); } }
+    else if (ad) {
+      // Sem desenho: a assinatura é a conta que finalizou, carimbada com data, hora e sessão.
+      doc.setFontSize(9); doc.setTextColor(27, 36, 48);
+      doc.text(`${ad.nome}${ad.setor ? ' — ' + ad.setor : ''}`, M, y + 10);
+      doc.setFontSize(7.5); doc.setTextColor(120, 126, 134);
+      doc.text(`Assinatura eletrônica · ${ad.email || 'conta do sistema'}`, M, y + 14.5);
+      doc.text(`${U.fmtDateTime(ad.em)} · sessão ${ad.sessao || '—'}`, M, y + 18.5);
+    }
     doc.setDrawColor(120, 126, 134); doc.line(M, y + 22, M + 80, y + 22);
     doc.setFontSize(8.5); doc.setTextColor(60, 66, 74);
     doc.text(`${form.solicitante} — Solicitante${form.setor ? ' (' + form.setor + ')' : ''}`, M, y + 26.5);
-    doc.setTextColor(120, 126, 134); doc.text(sig ? 'Assinado eletronicamente no sistema' : 'Assinatura do solicitante', M, y + 30.5);
+    doc.setTextColor(120, 126, 134); doc.text(sig || ad ? 'Assinado eletronicamente no sistema' : 'Assinatura do solicitante', M, y + 30.5);
     doc.setFontSize(8); doc.text('Validação do documento', 195, y + 4, { align: 'right' });
     doc.setFontSize(7.5);
     doc.text(`ID: ${form.id}`, 195, y + 8.5, { align: 'right' });
@@ -2259,6 +2318,29 @@ const FormView = {
       <td><input class="input input-sm" type="text" data-item="motivo" value="${U.attr(it.motivo)}" maxlength="${APP.motivoMax}" placeholder="Ex.: Avaria no transporte" autocomplete="off" aria-label="Motivo do ressarcimento"><div class="counter ${(it.motivo || '').length >= APP.motivoMax ? 'limit' : ''}">${(it.motivo || '').length}/${APP.motivoMax}</div></td>
       <td class="col-acao"><button type="button" class="btn-remove" data-action="remove-row" title="Remover linha" aria-label="Remover linha">✕</button></td></tr>`;
   },
+  /* --- nota fiscal já incluída em outro formulário --- */
+  conferirNf(tr, it) {
+    const cel = tr.querySelector('.col-nf'); if (!cel) return;
+    const velho = cel.querySelector('.nf-dup'); if (velho) velho.remove();
+    const nf = String(it.nf || '').trim();
+    const ja = nf ? FormService.ocorrenciasNf(nf, this.draft && this.draft.formId) : [];
+    tr.classList.toggle('dup', ja.length > 0);
+    if (!ja.length) return;
+    const f = ja[0];
+    cel.insertAdjacentHTML('beforeend', `<div class="nf-dup">Já incluída em <b>${U.esc(f.numero)}</b> — ${U.esc(f.transportadora)} · ${U.esc(f.status)}${ja.length > 1 ? ' (+' + (ja.length - 1) + ')' : ''}</div>`);
+  },
+  conferirTodasNf() {
+    const p = this.panel(), d = this.draft; if (!p || !d) return;
+    d.itens.forEach(it => { const tr = p.querySelector(`tr[data-rid="${it.rid}"]`); if (tr) this.conferirNf(tr, it); });
+  },
+  renderBuscaNf(texto) {
+    const out = document.getElementById('nfFindOut'); if (!out) return;
+    const q = String(texto || '').trim();
+    if (q.length < 2) { out.innerHTML = ''; return; }
+    const achados = FormService.buscarNf(q);
+    if (!achados.length) { out.innerHTML = `<div class="nf-find-empty">Nenhum formulário com nota fiscal contendo “${U.esc(q)}”. Pode incluir.</div>`; return; }
+    out.innerHTML = achados.map(h => `<div class="nf-find-hit"><b>NF ${U.esc(h.item.nf)}</b><span class="badge ${U.attr(h.form.status)}">${U.esc(h.form.status)}</span><span>${U.esc(h.form.numero)}</span><span>${U.esc(h.form.transportadora)}</span><span>${U.esc(U.fmtMoney(h.item.valor))}</span><span class="muted">${U.esc(U.fmtDate(h.form.criadoEm))} · ${U.esc(h.form.solicitante)}</span></div>`).join('');
+  },
   anexosHtml() {
     return (this.draft.anexos || []).map(a => `<li><span class="nm" title="${U.attr(a.nome)}">${U.esc(a.nome)}</span><span class="sz">${U.esc(U.fmtBytes(a.tamanho || 0))}</span><button type="button" class="btn btn-xs btn-secondary" data-action="attach-open" data-id="${U.attr(a.id)}">Abrir</button><button type="button" class="btn btn-xs btn-secondary" data-action="attach-remove" data-id="${U.attr(a.id)}">Remover</button></li>`).join('');
   },
@@ -2281,6 +2363,10 @@ const FormView = {
         <div class="field"><label class="req" for="fSolicitante">Solicitante</label><select class="select" id="fSolicitante" data-field="solicitanteId"><option value="">Selecione…</option>${Catalog.usuarios().map(u => `<option value="${a(u.id)}" ${u.id === d.solicitanteId ? 'selected' : ''}>${e(u.nome)} - ${e(u.setor)}</option>`).join('')}</select></div>
         <div class="field"><label class="req" for="fFilial">Filial</label><select class="select" id="fFilial" data-field="filial"><option value="">Selecione…</option>${Catalog.filiais().map(f => `<option value="${a(f)}" ${f === d.filial ? 'selected' : ''}>${e(f)}</option>`).join('')}</select></div>
       </div>
+      <div class="nf-find">
+        <input class="input input-sm" id="nfFind" type="search" autocomplete="off" aria-label="Consultar nota fiscal já incluída no sistema" placeholder="Consultar nota fiscal já incluída no sistema — digite ao menos 2 dígitos">
+        <div class="nf-find-out" id="nfFindOut"></div>
+      </div>
       <div class="nf-wrap">
         <table class="nf-table"><thead><tr><th class="idx">#</th><th class="col-nf">Nº da nota fiscal</th><th class="col-valor">Valor (R$)</th><th>Motivo do ressarcimento <span class="muted hide-sm" style="text-transform:none;letter-spacing:0">(máx. ${APP.motivoMax} caracteres)</span></th><th class="col-acao">Ação</th></tr></thead>
         <tbody id="nfBody">${d.itens.map((it, i) => this.rowHtml(it, i)).join('')}</tbody></table>
@@ -2296,10 +2382,14 @@ const FormView = {
           <ul class="attach-list" id="attachList">${this.anexosHtml()}</ul>
           ${AttachmentStore.disponivel ? '<div class="small muted mt8">Imagens anexadas são incorporadas ao final do PDF.</div>' : '<div class="small muted mt8">Armazenamento de anexos indisponível neste navegador.</div>'}
         </div></details>
-        <details class="opt" ${d.assinatura || s.exigirAssinatura ? 'open' : ''} id="sigDetails"><summary>Assinatura eletrônica do solicitante <span class="tag">${s.exigirAssinatura ? 'obrigatória' : 'opcional'}</span></summary><div class="body">
+        ${SB.ativo() ? `<details class="opt" open id="sigDetails"><summary>Assinatura eletrônica <span class="tag">automática</span></summary><div class="body">
+          <div class="sig-digital"><div class="nm">${e(Session.atual ? Session.atual.nome : '—')}</div>
+          <div class="small muted">${e(Session.atual ? (Session.atual.setor || '') : '')}${Session.atual && Session.atual.email ? ' · ' + e(Session.atual.email) : ''}</div>
+          <div class="small muted mt8">Você entrou com login e senha, então o PDF já sai assinado por esta conta, com data, hora e o hash do documento. Não é preciso assinar à mão.</div></div>
+        </div></details>` : `<details class="opt" ${d.assinatura || s.exigirAssinatura ? 'open' : ''} id="sigDetails"><summary>Assinatura eletrônica do solicitante <span class="tag">${s.exigirAssinatura ? 'obrigatória' : 'opcional'}</span></summary><div class="body">
           <div class="sig-wrap"><canvas class="sig-canvas" id="sigCanvas"></canvas><div class="sig-line"></div><div class="sig-hint">Assine com o mouse ou o dedo</div></div>
           <div class="flex mt8"><button type="button" class="btn btn-secondary btn-sm" data-action="sig-clear">Limpar assinatura</button><span class="small muted" id="sigStatus">${d.assinatura ? 'Assinatura registrada' : ''}</span></div>
-        </div></details>
+        </div></details>`}
       </div>
       <div id="formErrors"></div>
       <div class="form-actions">
@@ -2309,7 +2399,7 @@ const FormView = {
           <button type="button" class="btn btn-primary" data-action="finalize" ${pode ? '' : 'disabled'}>Finalizar formulário</button>
         </div>
       </div>`;
-    this.atualizarTotal(); this.initAssinatura(); this.initDropzone();
+    this.atualizarTotal(); this.initAssinatura(); this.initDropzone(); this.conferirTodasNf();
   },
   atualizarCabecalho() {
     const d = this.draft; const n = document.getElementById('formNumero'), st = document.getElementById('formStatus');
@@ -2341,6 +2431,7 @@ const FormView = {
   },
   onInput(e) {
     const el = e.target; const d = this.draft; if (!d) return;
+    if (el.id === 'nfFind') { this.renderBuscaNf(el.value); return; }
     if (el.dataset.item) {
       const tr = el.closest('tr'); const it = d.itens.find(i => i.rid === tr.dataset.rid); if (!it) return;
       if (el.dataset.item === 'valor') {
@@ -2348,7 +2439,7 @@ const FormView = {
         el.classList.toggle('warn', (Number(Store.settings.limiteAlerta) || 0) > 0 && c > Store.settings.limiteAlerta * 100);
       } else if (el.dataset.item === 'motivo') {
         it.motivo = el.value; const cnt = tr.querySelector('.counter'); cnt.textContent = `${el.value.length}/${APP.motivoMax}`; cnt.classList.toggle('limit', el.value.length >= APP.motivoMax);
-      } else it.nf = el.value;
+      } else { it.nf = el.value; this.conferirNf(tr, it); }
       el.classList.remove('invalid'); this.atualizarTotal(); this.marcarAlterado();
     } else if (el.dataset.field) {
       d[el.dataset.field] = el.value; el.classList.remove('invalid'); this.marcarAlterado();
@@ -2804,7 +2895,9 @@ const LogsView = {
         const anx = el.querySelector('#detAnexos');
         if (form.anexos && form.anexos.length) anx.innerHTML = `<ul class="attach-list">${form.anexos.map(a => `<li><span class="nm">${e(a.nome)}</span><span class="sz">${e(U.fmtBytes(a.tamanho || 0))}</span><button type="button" class="btn btn-xs btn-secondary" data-act="anexo-open" data-id="${U.attr(a.id)}">Abrir</button></li>`).join('')}</ul>`; else anx.textContent = 'Nenhum anexo.';
         const sig = await PdfService._assinaturaDataUrl(form); const sd = el.querySelector('#detSig');
-        if (sig) { sd.textContent = ''; const im = new Image(); im.src = sig; im.alt = 'Assinatura'; im.style.cssText = 'max-width:240px;border:1px solid var(--border);border-radius:6px;background:#fff'; sd.appendChild(im); } else sd.textContent = 'Sem assinatura eletrônica.';
+        if (sig) { sd.textContent = ''; const im = new Image(); im.src = sig; im.alt = 'Assinatura'; im.style.cssText = 'max-width:240px;border:1px solid var(--border);border-radius:6px;background:#fff'; sd.appendChild(im); }
+        else if (form.assinaturaDigital) { const ad = form.assinaturaDigital; sd.textContent = `Assinado eletronicamente por ${ad.nome}${ad.setor ? ' (' + ad.setor + ')' : ''} em ${U.fmtDateTime(ad.em)}${ad.email ? ' · ' + ad.email : ''}`; }
+        else sd.textContent = 'Sem assinatura eletrônica.';
       } });
   },
 };
@@ -2874,7 +2967,8 @@ const ConfigView = {
             <div class="field"><label>Separador do CSV</label><select class="select" id="cfgSep"><option value=";" ${s.csvSeparador === ';' ? 'selected' : ''}>; — Excel Brasil</option><option value="," ${s.csvSeparador === ',' ? 'selected' : ''}>, — internacional</option></select><span class="hint">Com ";" o decimal usa vírgula; com "," usa ponto</span></div>
             <div class="field"><label>Novo PIN de administrador</label><input class="input" id="cfgPin" type="password" placeholder="em branco para manter" autocomplete="new-password"></div>
           </div>
-          <div class="mt12"><label class="check"><input type="checkbox" id="cfgAssin" ${s.exigirAssinatura ? 'checked' : ''}> Exigir assinatura eletrônica para finalizar</label></div>
+          <div class="mt12"><label class="check"><input type="checkbox" id="cfgNfDup" ${s.bloquearNfDuplicada !== false ? 'checked' : ''}> Barrar nota fiscal já incluída em outro formulário</label></div>
+          <div class="mt8"><label class="check"><input type="checkbox" id="cfgAssin" ${s.exigirAssinatura ? 'checked' : ''}> Exigir assinatura desenhada para finalizar${SB.ativo() ? ' <span class="muted">— não se aplica: aqui a assinatura é o login</span>' : ''}</label></div>
           <div class="mt8"><label class="check"><input type="checkbox" id="cfgSim" ${s.simularPresenca ? 'checked' : ''}> Simular usuários online (somente na versão local)</label></div>
           <div class="right mt12"><button type="button" class="btn btn-primary btn-sm" data-cfg="save-geral">Salvar parâmetros</button></div>
         </div></div>
@@ -2922,7 +3016,7 @@ const ConfigView = {
       case 'lock': Permissions.bloquear(); this.render(); break;
       case 'save-geral': {
         const pin = val('cfgPin').trim();
-        const p = { empresa: val('cfgEmpresa').trim(), prefixoNumeracao: (val('cfgPrefixo').trim() || 'RES').toUpperCase(), limiteAlerta: Math.max(0, Number(val('cfgLimite')) || 0), csvSeparador: val('cfgSep'), exigirAssinatura: root.querySelector('#cfgAssin').checked, simularPresenca: root.querySelector('#cfgSim').checked };
+        const p = { empresa: val('cfgEmpresa').trim(), prefixoNumeracao: (val('cfgPrefixo').trim() || 'RES').toUpperCase(), limiteAlerta: Math.max(0, Number(val('cfgLimite')) || 0), csvSeparador: val('cfgSep'), exigirAssinatura: root.querySelector('#cfgAssin').checked, bloquearNfDuplicada: root.querySelector('#cfgNfDup').checked, simularPresenca: root.querySelector('#cfgSim').checked };
         if (pin) { if (pin.length < 4) { Toast.show('O PIN deve ter pelo menos 4 caracteres.', 'error'); return; } p.adminPin = pin; }
         await this.salvar(p, 'Parâmetros gerais' + (pin ? ' (PIN alterado)' : '')); this.renderPanel(); break;
       }
