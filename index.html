@@ -30,6 +30,7 @@
 -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/dist/umd/supabase.js" defer></script>
 <style>
 /* =====================================================================
    1. TOKENS DE DESIGN
@@ -770,10 +771,354 @@ const LocalAdapter = {
   usage() { let bytes = 0; for (const k of Object.keys(localStorage)) if (k.startsWith(APP.prefixo)) bytes += (k.length + (localStorage.getItem(k) || '').length) * 2; return bytes; },
   clearAll() { for (const k of Object.keys(localStorage)) if (k.startsWith(APP.prefixo)) localStorage.removeItem(k); },
 };
-const Adapter = LocalAdapter;
+/* =====================================================================
+   3b. NUVEM — Supabase
+   Mesmo contrato do LocalAdapter, de modo que repositórios, serviços e UI
+   não sabem de onde o dado vem. Deixar `url` vazio devolve o app ao modo
+   local (cada navegador com a sua base).
+   ===================================================================== */
+const NUVEM = Object.freeze({
+  url: 'https://yuaxuidorqpwfzhkerve.supabase.co',
+  anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl1YXh1aWRvcnFwd2Z6aGtlcnZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAwNjMxMzksImV4cCI6MjEwNTYzOTEzOX0.DN057AhIAmIS42uVHhTTN7IkJii3rLcmN3Tc5lv15MA',
+  bucket: 'ressarc-anexos',
+  pagina: 1000,       // teto do PostgREST: acima disso ele corta a resposta sem avisar
+  sincronizar: 20000, // relê o que os outros gravaram
+});
 
-/** Anexos e assinaturas (binários) ficam no IndexedDB, fora do limite do localStorage. */
-const AttachmentStore = {
+const SB = {
+  _cli: null,
+  ativo() { return !!(NUVEM.url && NUVEM.anonKey); },
+  cli() {
+    if (this._cli) return this._cli;
+    if (!window.supabase || !window.supabase.createClient) throw new Error('A biblioteca do Supabase não carregou. Verifique a conexão e recarregue a página.');
+    this._cli = window.supabase.createClient(NUVEM.url, NUVEM.anonKey, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, storageKey: APP.prefixo + 'auth' },
+    });
+    return this._cli;
+  },
+  /** Traduz o erro do PostgREST para algo que o operador entenda. */
+  erro(e, onde) {
+    const msg = String((e && (e.message || e.error_description)) || e || '');
+    if (/permission denied/i.test(msg)) return new Error('Sua sessão expirou. Recarregue a página e entre novamente.');
+    if (/row-level security|violates row-level/i.test(msg)) return new Error('Seu usuário não tem permissão para esta operação.');
+    if (/Failed to fetch|NetworkError/i.test(msg)) return new Error('Sem conexão com o servidor. O dado não foi gravado.');
+    return new Error(`Falha em ${onde}: ${msg}`);
+  },
+};
+
+/** Conversão entre o objeto que o app manipula (camelCase) e a linha do banco. */
+const Mapa = {
+  iso(v) { try { return v ? new Date(v).toISOString() : null; } catch (e) { return null; } },
+  // Campos que viram coluna; tudo que sobrar do formulário vai para 'dados'.
+  _COLS_FORM: ['id','numero','transportadoraId','transportadora','cnpj','solicitanteId','solicitante','setor','filial','status','total','criadoEm','finalizadoEm','canceladoEm','reconciliacao','reconciliacaoNota','hash','excluido','updatedAt'],
+  formParaLinha(f) {
+    const dados = { ...f }; this._COLS_FORM.forEach(k => { delete dados[k]; });
+    return {
+      id: f.id, numero: f.numero, transportadora_id: f.transportadoraId, transportadora: f.transportadora,
+      cnpj: f.cnpj || null, solicitante_id: f.solicitanteId, solicitante: f.solicitante, setor: f.setor || null,
+      filial: f.filial, status: f.status, total: Number(f.total) || 0,
+      criado_em: this.iso(f.criadoEm) || U.nowISO(), finalizado_em: this.iso(f.finalizadoEm), cancelado_em: this.iso(f.canceladoEm),
+      reconciliacao: f.reconciliacao || null, reconciliacao_nota: f.reconciliacaoNota || null,
+      hash: f.hash || null, excluido: !!f.excluido, atualizado_em: U.nowISO(), dados,
+    };
+  },
+  linhaParaForm(r) {
+    const d = r.dados || {};
+    return { ...d,
+      id: r.id, numero: r.numero, transportadoraId: r.transportadora_id, transportadora: r.transportadora,
+      cnpj: r.cnpj || '', solicitanteId: r.solicitante_id, solicitante: r.solicitante, setor: r.setor || '',
+      filial: r.filial, status: r.status, total: Number(r.total) || 0,
+      criadoEm: this.iso(r.criado_em), finalizadoEm: this.iso(r.finalizado_em), canceladoEm: this.iso(r.cancelado_em),
+      reconciliacao: r.reconciliacao || 'Pendente', reconciliacaoNota: r.reconciliacao_nota || '',
+      hash: r.hash || null, excluido: !!r.excluido, updatedAt: this.iso(r.atualizado_em),
+      itens: Array.isArray(d.itens) ? d.itens : [], anexos: Array.isArray(d.anexos) ? d.anexos : [],
+      revisoes: Array.isArray(d.revisoes) ? d.revisoes : [], observacoes: d.observacoes || '',
+    };
+  },
+  logParaLinha(l) {
+    return { id: l.id, at: this.iso(l.at) || U.nowISO(), evento: l.evento, evento_label: l.eventoLabel || null,
+      operador: l.operador || null, operador_setor: l.operadorSetor || null, solicitante: l.solicitante || null,
+      form_id: l.formId || null, form_numero: l.formNumero || null,
+      transportadora_id: l.transportadoraId || null, transportadora: l.transportadora || null,
+      filial: l.filial || null, status: l.status || null,
+      total: (l.total === undefined || l.total === null) ? null : Number(l.total),
+      nfs: l.nfs || [], detalhe: l.detalhe || null };
+  },
+  linhaParaLog(r) {
+    return { id: r.id, at: this.iso(r.at), evento: r.evento, eventoLabel: r.evento_label || r.evento,
+      operador: r.operador || '—', operadorSetor: r.operador_setor || '', solicitante: r.solicitante || '—',
+      formId: r.form_id, formNumero: r.form_numero || '', transportadoraId: r.transportadora_id || '',
+      transportadora: r.transportadora || '', filial: r.filial || '', status: r.status || '',
+      total: r.total === null ? null : Number(r.total), nfs: r.nfs || [], detalhe: r.detalhe || '' };
+  },
+};
+
+const SupabaseAdapter = {
+  // Espelho em memória das coleções em lista: o contrato do Adapter manda
+  // devolver a lista inteira a cada gravação, e reler tudo do servidor a
+  // cada tecla seria absurdo. Quem atualiza o espelho com o que os outros
+  // gravaram é o Sync, abaixo.
+  _cache: { forms: null, logs: null },
+  _marca: { forms: null, logs: null },
+
+  /** Lê tudo, de mil em mil. Sem isto o PostgREST devolve só as 1.000 primeiras, calado. */
+  async _paginar(tabela, ordem) {
+    const out = []; let de = 0;
+    for (;;) {
+      const { data, error } = await SB.cli().from(tabela).select('*')
+        .order(ordem, { ascending: false }).range(de, de + NUVEM.pagina - 1);
+      if (error) throw SB.erro(error, tabela);
+      out.push(...(data || []));
+      if (!data || data.length < NUVEM.pagina) break;
+      de += NUVEM.pagina;
+    }
+    return out;
+  },
+
+  async readAll(col, fallback) {
+    const cli = SB.cli();
+    switch (col) {
+      case 'forms': {
+        this._cache.forms = (await this._paginar('ressarc_forms', 'criado_em')).map(r => Mapa.linhaParaForm(r));
+        this._marca.forms = this._cache.forms.reduce((m, f) => ((f.updatedAt || '') > m ? f.updatedAt : m), '');
+        return this._cache.forms;
+      }
+      case 'logs': {
+        this._cache.logs = (await this._paginar('ressarc_logs', 'at')).map(r => Mapa.linhaParaLog(r));
+        this._marca.logs = this._cache.logs.length ? this._cache.logs[0].at : '';
+        return this._cache.logs;
+      }
+      case 'settings': {
+        const [cfg, eq] = await Promise.all([
+          cli.from('ressarc_settings').select('dados').eq('id', 1).maybeSingle(),
+          cli.from('ressarc_usuarios').select('slug,nome,setor,ativo').eq('ativo', true).order('nome'),
+        ]);
+        if (cfg.error) throw SB.erro(cfg.error, 'configurações');
+        if (eq.error) throw SB.erro(eq.error, 'equipe');
+        const s = { ...U.clone(fallback), ...((cfg.data && cfg.data.dados) || {}) };
+        // A equipe é a tabela, não o jsonb: quem entra e quem sai passa pelo cadastro.
+        if (eq.data && eq.data.length) s.usuarios = eq.data.map(u => ({ id: u.slug, nome: u.nome, setor: u.setor }));
+        s.simularPresenca = false; // na nuvem a presença é real; não há o que simular
+        return s;
+      }
+      case 'drafts': {
+        const { data, error } = await cli.from('ressarc_drafts').select('transportadora_id,dados');
+        if (error) throw SB.erro(error, 'rascunhos');
+        const o = {}; (data || []).forEach(r => { o[r.transportadora_id] = r.dados; }); return o;
+      }
+      case 'prefs': {
+        const { data, error } = await cli.from('ressarc_prefs').select('dados').maybeSingle();
+        if (error) throw SB.erro(error, 'preferências');
+        return (data && data.dados) || U.clone(fallback);
+      }
+      case 'sequences': {
+        const { data, error } = await cli.from('ressarc_sequences').select('ano,valor');
+        if (error) throw SB.erro(error, 'numeração');
+        const o = {}; (data || []).forEach(r => { o[r.ano] = r.valor; }); return o;
+      }
+      case 'presence': {
+        const corte = new Date(Date.now() - 120000).toISOString();
+        const { data, error } = await cli.from('ressarc_presence').select('*').gte('visto_em', corte);
+        if (error) throw SB.erro(error, 'presença');
+        const o = {}; (data || []).forEach(r => {
+          const t = new Date(r.visto_em).getTime();
+          o[r.usuario] = { usuarioId: r.slug || r.usuario, nome: r.nome, setor: r.setor, lastSeen: t, lastActive: t };
+        });
+        return o;
+      }
+      // A fila de envio é do dispositivo, não da equipe: continua local.
+      case 'outbox': return LocalAdapter.readAll(col, fallback);
+      default: return U.clone(fallback);
+    }
+  },
+
+  async upsert(col, item) {
+    if (col === 'outbox') return LocalAdapter.upsert(col, item);
+    const tabela = col === 'forms' ? 'ressarc_forms' : 'ressarc_logs';
+    const linha = col === 'forms' ? Mapa.formParaLinha(item) : Mapa.logParaLinha(item);
+    // Formulário regrava; log não. authenticated não tem UPDATE em ressarc_logs,
+    // e um upsert comum vira INSERT ... ON CONFLICT DO UPDATE, que já pede o
+    // privilégio na hora de planejar — morreria com 42501 mesmo sem conflito.
+    // ignoreDuplicates manda DO NOTHING: reenvio da outbox não duplica nem estoura.
+    const { error } = col === 'forms'
+      ? await SB.cli().from(tabela).upsert(linha, { onConflict: 'id' })
+      : await SB.cli().from(tabela).upsert(linha, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw SB.erro(error, col === 'forms' ? 'gravar formulário' : 'gravar log');
+    const lista = this._cache[col] || (this._cache[col] = []);
+    const i = lista.findIndex(x => x.id === item.id);
+    if (i >= 0) lista[i] = item; else lista.unshift(item);
+    this._marca[col] = col === 'forms' ? linha.atualizado_em : linha.at;
+    return lista;
+  },
+
+  async remove(col, id) {
+    if (col === 'outbox') return LocalAdapter.remove(col, id);
+    // forms e logs não têm DELETE por desenho: cancelar é soft delete.
+    throw new Error('Registros de ' + col + ' não são removidos: o cancelamento preserva o histórico.');
+  },
+
+  async writeAll(col, data) {
+    const cli = SB.cli();
+    switch (col) {
+      case 'settings': {
+        const dados = { ...data }; delete dados.usuarios; // a equipe mora na própria tabela
+        const { error } = await cli.from('ressarc_settings').update({ dados, atualizado_em: U.nowISO() }).eq('id', 1);
+        if (error) throw SB.erro(error, 'salvar configurações');
+        await this._sincronizarEquipe(data.usuarios);
+        return data;
+      }
+      case 'prefs': {
+        const { error } = await cli.from('ressarc_prefs')
+          .upsert({ usuario: Session.authId, dados: data, atualizado_em: U.nowISO() }, { onConflict: 'usuario' });
+        if (error) throw SB.erro(error, 'salvar preferências');
+        return data;
+      }
+      case 'drafts': case 'presence': case 'sequences': return data; // gravados por chave / RPC
+      case 'outbox': return LocalAdapter.writeAll(col, data);
+      default: return data;
+    }
+  },
+
+  async writeKey(col, key, value) {
+    const cli = SB.cli();
+    if (col === 'drafts') {
+      const { error } = await cli.from('ressarc_drafts')
+        .upsert({ usuario: Session.authId, transportadora_id: key, dados: value, atualizado_em: U.nowISO() },
+                { onConflict: 'usuario,transportadora_id' });
+      if (error) throw SB.erro(error, 'salvar rascunho');
+      return value;
+    }
+    if (col === 'presence') {
+      const { error } = await cli.from('ressarc_presence')
+        .upsert({ usuario: Session.authId, slug: value.usuarioId, nome: value.nome, setor: value.setor, visto_em: U.nowISO() },
+                { onConflict: 'usuario' });
+      if (error) throw SB.erro(error, 'presença');
+      return value;
+    }
+    if (col === 'outbox') return LocalAdapter.writeKey(col, key, value);
+    return value;
+  },
+
+  async removeKey(col, key) {
+    if (col === 'drafts') {
+      const { error } = await SB.cli().from('ressarc_drafts').delete()
+        .eq('usuario', Session.authId).eq('transportadora_id', key);
+      if (error) throw SB.erro(error, 'apagar rascunho');
+      return {};
+    }
+    if (col === 'presence') { await SB.cli().from('ressarc_presence').delete().eq('usuario', Session.authId); return {}; }
+    if (col === 'outbox') return LocalAdapter.removeKey(col, key);
+    return {};
+  },
+
+  /** Configurações > equipe: o que a tela mostra vira cadastro. Quem sai fica inativo, não some. */
+  async _sincronizarEquipe(lista) {
+    if (!Array.isArray(lista) || !lista.length) return;
+    const cli = SB.cli();
+    const { data: atuais, error } = await cli.from('ressarc_usuarios').select('slug,ativo');
+    if (error) throw SB.erro(error, 'equipe');
+    const linhas = lista.map(u => ({ slug: u.id, nome: u.nome, setor: u.setor, ativo: true }));
+    const up = await cli.from('ressarc_usuarios').upsert(linhas, { onConflict: 'slug' });
+    if (up.error) throw SB.erro(up.error, 'equipe');
+    const querem = new Set(lista.map(u => u.id));
+    const fora = (atuais || []).filter(a => a.ativo && !querem.has(a.slug)).map(a => a.slug);
+    if (fora.length) {
+      const off = await cli.from('ressarc_usuarios').update({ ativo: false }).in('slug', fora);
+      if (off.error) throw SB.erro(off.error, 'equipe');
+    }
+  },
+
+  usage() { return JSON.stringify(this._cache.forms || []).length + JSON.stringify(this._cache.logs || []).length; },
+  clearAll() { throw new Error('A base agora é compartilhada: apagar tudo afetaria a equipe inteira. Isso se faz pelo painel do Supabase.'); },
+};
+
+/** Traz o que os outros gravaram. É o equivalente ao evento 'storage' do modo local. */
+const Sync = {
+  _timer: null,
+  start() {
+    if (!SB.ativo() || this._timer) return;
+    this._timer = setInterval(() => this.tick().catch(e => console.warn('[sync]', e)), NUVEM.sincronizar);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) this.tick().catch(() => {}); });
+  },
+  stop() { clearInterval(this._timer); this._timer = null; },
+  async tick() {
+    if (!Session.atual || document.hidden) return;
+    const cli = SB.cli();
+    const [f, l] = await Promise.all([
+      cli.from('ressarc_forms').select('atualizado_em').order('atualizado_em', { ascending: false }).limit(1),
+      cli.from('ressarc_logs').select('at').order('at', { ascending: false }).limit(1),
+    ]);
+    if (!f.error && f.data) {
+      const m = f.data.length ? Mapa.iso(f.data[0].atualizado_em) : '';
+      if (m !== SupabaseAdapter._marca.forms) { await Store.reload('forms'); Bus.emit('data:changed', 'forms'); }
+    }
+    if (!l.error && l.data) {
+      const m = l.data.length ? Mapa.iso(l.data[0].at) : '';
+      if (m !== SupabaseAdapter._marca.logs) { await Store.reload('logs'); Bus.emit('data:changed', 'logs'); Bus.emit('logs:changed'); }
+    }
+  },
+};
+
+const Adapter = SB.ativo() ? SupabaseAdapter : LocalAdapter;
+
+/** Anexos e assinaturas na nuvem: binário no Storage, metadado na tabela.
+ *  Mesmo contrato do IdbStore — quem chama não sabe a diferença. */
+const CloudStore = {
+  disponivel: false,
+  async init() { this.disponivel = SB.ativo(); return this.disponivel; },
+  _caminho(rec) { return `${rec.formId || 'rascunho'}/${rec.id}`; },
+  _rec(m, blob) {
+    return { id: m.id, formId: m.form_id, kind: m.kind, nome: m.nome, tipo: m.tipo,
+             tamanho: m.tamanho, criadoEm: Mapa.iso(m.criado_em), blob };
+  },
+  async _baixar(m) {
+    const { data, error } = await SB.cli().storage.from(NUVEM.bucket).download(m.caminho);
+    if (error) throw SB.erro(error, 'baixar anexo');
+    return this._rec(m, data);
+  },
+  async put(rec) {
+    const caminho = this._caminho(rec);
+    const up = await SB.cli().storage.from(NUVEM.bucket)
+      // upsert:false de propósito: o caminho termina num uuid novo a cada anexo,
+      // então nunca colide, e o bucket não tem política de UPDATE — pedir upsert
+      // mandaria o Storage tentar um caminho que a política não cobre.
+      .upload(caminho, rec.blob, { contentType: rec.tipo || 'application/octet-stream', upsert: false });
+    if (up.error) throw SB.erro(up.error, 'enviar anexo');
+    const { error } = await SB.cli().from('ressarc_anexos').upsert({
+      id: rec.id, form_id: rec.formId || null, nome: rec.nome, tipo: rec.tipo || null,
+      tamanho: rec.tamanho || (rec.blob && rec.blob.size) || 0, caminho,
+      kind: rec.kind || 'anexo', criado_em: Mapa.iso(rec.criadoEm) || U.nowISO(),
+      // idem ressarc_logs: o registro do anexo não tem UPDATE, só nasce e some
+    }, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw SB.erro(error, 'registrar anexo');
+    return rec.id;
+  },
+  async get(id) {
+    const { data, error } = await SB.cli().from('ressarc_anexos').select('*').eq('id', id).maybeSingle();
+    if (error) throw SB.erro(error, 'anexo');
+    return data ? this._baixar(data) : null;
+  },
+  async remove(id) {
+    const { data } = await SB.cli().from('ressarc_anexos').select('caminho').eq('id', id).maybeSingle();
+    if (data && data.caminho) await SB.cli().storage.from(NUVEM.bucket).remove([data.caminho]);
+    const { error } = await SB.cli().from('ressarc_anexos').delete().eq('id', id);
+    if (error) throw SB.erro(error, 'remover anexo');
+  },
+  async listByForm(formId) {
+    const { data, error } = await SB.cli().from('ressarc_anexos').select('*').eq('form_id', formId);
+    if (error) throw SB.erro(error, 'anexos do formulário');
+    return Promise.all((data || []).map(m => this._baixar(m)));
+  },
+  async all() {
+    const { data, error } = await SB.cli().from('ressarc_anexos').select('*');
+    if (error) throw SB.erro(error, 'anexos');
+    return Promise.all((data || []).map(m => this._baixar(m)));
+  },
+  async clear() { throw new Error('Os anexos são compartilhados: a limpeza se faz pelo painel do Supabase.'); },
+};
+
+/** Anexos e assinaturas (binários) no IndexedDB, fora do limite do localStorage. */
+const IdbStore = {
   db: null, disponivel: false,
   init() {
     return new Promise(resolve => {
@@ -802,6 +1147,8 @@ const AttachmentStore = {
   all() { return this.disponivel ? this._req(this._store('readonly').getAll()) : Promise.resolve([]); },
   clear() { return this.disponivel ? this._req(this._store('readwrite').clear()) : Promise.resolve(); },
 };
+
+const AttachmentStore = SB.ativo() ? CloudStore : IdbStore;
 
 /* =====================================================================
    4. STORE — estado em memória com gravação imediata (write-through)
@@ -860,29 +1207,72 @@ const Catalog = {
    5. SERVIÇOS
    ===================================================================== */
 
-/** Sessão do usuário (por aba). Na nuvem: token/cookie de autenticação. */
+/** Sessão do usuário. Na nuvem: conta própria, com e-mail e senha (Supabase Auth).
+ *  Sem nuvem: identificação por seleção de nome, como na versão local. */
 const Session = {
-  atual: null,
+  atual: null, authId: null,
   _key: APP.prefixo + 'session',
-  init() {
-    try {
-      const raw = sessionStorage.getItem(this._key);
-      if (raw) { const s = JSON.parse(raw); const u = Catalog.usuario(s.usuarioId); if (u) { this.atual = { ...s, nome: u.nome, setor: u.setor }; return true; } }
-    } catch (e) { /* ignora */ }
-    return false;
+
+  async init() {
+    if (!SB.ativo()) {
+      try {
+        const raw = sessionStorage.getItem(this._key);
+        if (raw) { const s = JSON.parse(raw); const u = Catalog.usuario(s.usuarioId); if (u) { this.atual = { ...s, nome: u.nome, setor: u.setor }; return true; } }
+      } catch (e) { /* ignora */ }
+      return false;
+    }
+    let sess = null;
+    try { const { data } = await SB.cli().auth.getSession(); sess = data && data.session; } catch (e) { return false; }
+    if (!sess) return false;
+    try { return await this.adotar(sess.user); } catch (e) { console.warn('[sessão]', e); return false; }
   },
-  async login(usuarioId) {
-    const u = Catalog.usuario(usuarioId); if (!u) throw new Error('Usuário inválido');
-    this.atual = { sessionId: U.uuid(), usuarioId: u.id, nome: u.nome, setor: u.setor, loginAt: U.nowISO() };
-    sessionStorage.setItem(this._key, JSON.stringify(this.atual));
-    await Store.savePrefs({ ultimoUsuario: u.id });
-    await Audit.log('LOGIN', { detalhe: `Sessão iniciada (${u.setor})` });
+
+  /** A conta do Auth vira usuário do app através do cadastro. Conta sem cadastro não entra. */
+  async adotar(user) {
+    this.authId = user.id;
+    const { data, error } = await SB.cli().from('ressarc_usuarios')
+      .select('slug,nome,setor,admin,ativo').eq('auth_id', user.id).maybeSingle();
+    if (error) { this.authId = null; throw SB.erro(error, 'identificar usuário'); }
+    if (!data || !data.ativo) {
+      this.authId = null; await SB.cli().auth.signOut();
+      throw new Error('Esta conta não está liberada no sistema. Fale com o administrador.');
+    }
+    this.atual = { sessionId: U.uuid(), usuarioId: data.slug, nome: data.nome, setor: data.setor,
+                   admin: !!data.admin, email: user.email, loginAt: U.nowISO() };
+    return true;
+  },
+
+  async login(emailOuId, senha) {
+    if (!SB.ativo()) {
+      const u = Catalog.usuario(emailOuId); if (!u) throw new Error('Usuário inválido');
+      this.atual = { sessionId: U.uuid(), usuarioId: u.id, nome: u.nome, setor: u.setor, loginAt: U.nowISO() };
+      sessionStorage.setItem(this._key, JSON.stringify(this.atual));
+      Bus.emit('session:changed'); return;
+    }
+    const { data, error } = await SB.cli().auth.signInWithPassword({ email: String(emailOuId).trim().toLowerCase(), password: senha });
+    if (error) {
+      const m = String(error.message || '');
+      if (/Invalid login/i.test(m)) throw new Error('E-mail ou senha incorretos.');
+      if (/Email not confirmed/i.test(m)) throw new Error('E-mail ainda não confirmado. Abra o link que o Supabase enviou.');
+      throw SB.erro(error, 'entrar');
+    }
+    await this.adotar(data.user);
     Bus.emit('session:changed');
   },
+
+  /** Registra a entrada na trilha. Só depois do Store carregado — o log vai para o banco. */
+  async registrarEntrada() {
+    if (!this.atual) return;
+    try { await Store.savePrefs({ ultimoUsuario: this.atual.usuarioId }); } catch (e) { /* preferência não é crítica */ }
+    await Audit.log('LOGIN', { detalhe: `Sessão iniciada (${this.atual.setor})` });
+  },
+
   async logout() {
-    if (this.atual) await Audit.log('LOGOUT', { detalhe: 'Sessão encerrada' });
+    if (this.atual) { try { await Audit.log('LOGOUT', { detalhe: 'Sessão encerrada' }); } catch (e) { /* ignora */ } }
+    try { await Presence.sair(); } catch (e) { /* ignora */ }
+    if (SB.ativo()) { try { await SB.cli().auth.signOut(); } catch (e) { /* ignora */ } }
     sessionStorage.removeItem(this._key); sessionStorage.removeItem(APP.prefixo + 'admin');
-    this.atual = null; Bus.emit('session:changed');
+    this.atual = null; this.authId = null; Bus.emit('session:changed');
   },
 };
 
@@ -894,7 +1284,10 @@ const Permissions = {
     if (!p) return true;
     return p[acao] !== false;
   },
-  adminOk() { return sessionStorage.getItem(APP.prefixo + 'admin') === '1'; },
+  // Na nuvem quem é administrador é a coluna 'admin' do cadastro, verificada
+  // também no servidor pelas políticas. O PIN só existe no modo local.
+  adminOk() { return SB.ativo() ? !!(Session.atual && Session.atual.admin) : sessionStorage.getItem(APP.prefixo + 'admin') === '1'; },
+  exigePin() { return !SB.ativo(); },
   desbloquear(pin) { if (String(pin) === String(Store.settings.adminPin)) { sessionStorage.setItem(APP.prefixo + 'admin', '1'); return true; } return false; },
   bloquear() { sessionStorage.removeItem(APP.prefixo + 'admin'); },
 };
@@ -925,7 +1318,18 @@ const Audit = {
 
 /** Numeração automática dos formulários: PREFIXO-ANO-SEQUÊNCIA (ex.: RES-2026-0001). */
 const Numbering = {
-  async proximo() { const ano = new Date().getFullYear(); const seq = await Store.nextSequence(ano); return `${Store.settings.prefixoNumeracao || 'RES'}-${ano}-${U.pad(seq, 4)}`; },
+  async proximo() {
+    const ano = new Date().getFullYear();
+    // Na nuvem quem incrementa é o banco: dois usuários salvando ao mesmo tempo
+    // tirariam o mesmo número se a conta fosse feita aqui.
+    let seq;
+    if (SB.ativo()) {
+      const { data, error } = await SB.cli().rpc('ressarc_proximo_numero', { p_ano: ano });
+      if (error) throw SB.erro(error, 'numeração');
+      seq = data; Store.state.sequences[ano] = data;
+    } else { seq = await Store.nextSequence(ano); }
+    return `${Store.settings.prefixoNumeracao || 'RES'}-${ano}-${U.pad(seq, 4)}`;
+  },
 };
 
 /** Fila de submissões (outbox): serializa gravações e permite retomar submissões interrompidas.
@@ -964,7 +1368,28 @@ const Presence = {
   stop() {
     clearInterval(this._timer);
     const s = Session.atual; if (!s) return;
+    if (SB.ativo()) { this._beaconSaida(); return; }
     try { const obj = LocalAdapter._read('presence') || {}; delete obj[s.sessionId]; LocalAdapter._write('presence', obj); } catch (e) { /* ignora */ }
+  },
+  /** Saída explícita (logout), com await. */
+  async sair() {
+    const s = Session.atual; if (!s) return;
+    if (SB.ativo()) { try { await Adapter.removeKey('presence', null); } catch (e) { /* ignora */ } return; }
+    try { const obj = LocalAdapter._read('presence') || {}; delete obj[s.sessionId]; LocalAdapter._write('presence', obj); } catch (e) { /* ignora */ }
+  },
+  /** No 'pagehide' não há tempo para uma promessa: keepalive entrega mesmo com a aba fechando.
+   *  Se falhar, não há perda — a leitura já descarta presença com mais de 2 min. */
+  _beaconSaida() {
+    try {
+      const tok = SB._cli && SB._cli.auth && SB._cli.auth.currentSession ? SB._cli.auth.currentSession.access_token : null;
+      const raw = localStorage.getItem(APP.prefixo + 'auth');
+      const jwt = tok || (raw ? (JSON.parse(raw).access_token || null) : null);
+      if (!jwt || !Session.authId) return;
+      fetch(`${NUVEM.url}/rest/v1/ressarc_presence?usuario=eq.${Session.authId}`, {
+        method: 'DELETE', keepalive: true,
+        headers: { apikey: NUVEM.anonKey, Authorization: 'Bearer ' + jwt },
+      }).catch(() => {});
+    } catch (e) { /* ignora */ }
   },
   async heartbeat() {
     const s = Session.atual; if (!s) return;
@@ -2045,7 +2470,55 @@ const FormView = {
 
 /* Identificação do usuário ao abrir o sistema */
 const LoginView = {
-  show() {
+  show() { return SB.ativo() ? this._nuvem() : this._local(); },
+
+  /** Conta própria: e-mail e senha. A promessa só resolve quando entra de verdade. */
+  _nuvem() {
+    return new Promise(res => {
+      const ultimo = (() => { try { return localStorage.getItem(APP.prefixo + 'ultimoEmail') || ''; } catch (e) { return ''; } })();
+      const m = Modal.open({ titulo: 'Entrar', semFechar: true, fecharFora: false, largura: 420,
+        corpo: `<p class="small muted">Use seu e-mail de trabalho. Toda ação no sistema fica registrada com o seu nome.</p>
+          <form data-form="login" autocomplete="on">
+            <label class="field"><span>E-mail</span>
+              <input type="email" name="email" required autocomplete="username" value="${U.attr(ultimo)}" placeholder="nome@bbdi.com.br"></label>
+            <label class="field"><span>Senha</span>
+              <input type="password" name="senha" required autocomplete="current-password" placeholder="••••••••"></label>
+            <div data-erro class="small" style="color:var(--danger);min-height:18px;margin:6px 0"></div>
+            <div class="row" style="gap:8px;justify-content:space-between;align-items:center">
+              <button type="button" class="btn ghost small" data-act="esqueci">Esqueci a senha</button>
+              <button type="submit" class="btn primary" data-act="entrar">Entrar</button>
+            </div>
+          </form>`,
+        onMount: el => {
+          const form = el.querySelector('[data-form=login]');
+          const erro = el.querySelector('[data-erro]');
+          const btn = el.querySelector('[data-act=entrar]');
+          setTimeout(() => (ultimo ? form.senha : form.email).focus(), 50);
+          form.addEventListener('submit', async ev => {
+            ev.preventDefault(); erro.textContent = ''; btn.disabled = true; btn.textContent = 'Entrando…';
+            try {
+              await Session.login(form.email.value, form.senha.value);
+              try { localStorage.setItem(APP.prefixo + 'ultimoEmail', form.email.value.trim().toLowerCase()); } catch (e) { /* ignora */ }
+              m.close(); res();
+            } catch (e) {
+              erro.textContent = e.message || String(e);
+              btn.disabled = false; btn.textContent = 'Entrar'; form.senha.value = ''; form.senha.focus();
+            }
+          });
+          el.querySelector('[data-act=esqueci]').addEventListener('click', async () => {
+            const mail = (form.email.value || '').trim();
+            if (!mail) { erro.textContent = 'Informe o e-mail primeiro.'; form.email.focus(); return; }
+            erro.textContent = '';
+            try {
+              await SB.cli().auth.resetPasswordForEmail(mail, { redirectTo: location.origin + location.pathname });
+              Toast.show('Se este e-mail tiver conta, o link de redefinição chegou na caixa de entrada.', 'info', 6000);
+            } catch (e) { erro.textContent = 'Não foi possível enviar o link agora.'; }
+          });
+        } });
+    });
+  },
+
+  _local() {
     return new Promise(res => {
       const usuarios = Catalog.usuarios(); const ultimo = Store.state.prefs.ultimoUsuario;
       const m = Modal.open({ titulo: 'Identifique-se para continuar', semFechar: true, fecharFora: false, largura: 440,
@@ -2363,7 +2836,7 @@ const ConfigView = {
           <div class="right"><button type="button" class="btn btn-primary btn-sm" data-cfg="save-carriers">Salvar transportadoras</button></div>
         </div></div>
         <div class="card"><div class="card-head"><h3>Dados e backup</h3></div><div class="card-body">
-          <dl class="kv"><dt>Versão</dt><dd>${e(APP.versao)} (schema ${APP.schema})</dd><dt>Formulários</dt><dd>${Store.state.forms.length}</dd><dt>Registros de log</dt><dd>${Store.state.logs.length}</dd><dt>Rascunhos</dt><dd>${Object.keys(Store.state.drafts).length}</dd><dt>Anexos</dt><dd>${AttachmentStore.disponivel ? 'IndexedDB disponível' : 'indisponível'}</dd><dt>Último snapshot</dt><dd>${snap ? e(U.fmtDateTime(snap.geradoEm)) : '—'}</dd></dl>
+          <dl class="kv"><dt>Versão</dt><dd>${e(APP.versao)} (schema ${APP.schema})</dd><dt>Formulários</dt><dd>${Store.state.forms.length}</dd><dt>Registros de log</dt><dd>${Store.state.logs.length}</dd><dt>Rascunhos</dt><dd>${Object.keys(Store.state.drafts).length}</dd><dt>Base</dt><dd>${SB.ativo() ? 'Supabase (compartilhada)' : 'somente este navegador'}</dd><dt>Anexos</dt><dd>${!AttachmentStore.disponivel ? 'indisponível' : (SB.ativo() ? 'Supabase Storage' : 'IndexedDB')}</dd><dt>Último snapshot</dt><dd>${snap ? e(U.fmtDateTime(snap.geradoEm)) : '—'}</dd></dl>
           <div class="small muted mt12">Uso do armazenamento local: ${e(U.fmtBytes(uso))} de ~5 MB</div><div class="storage-bar"><div style="width:${Math.min(100, uso / lim * 100).toFixed(1)}%"></div></div>
           <div class="flex flex-wrap mt12"><label class="check small"><input type="checkbox" id="cfgBkAnexos"> incluir anexos</label><button type="button" class="btn btn-secondary btn-sm" data-cfg="backup">Exportar backup (JSON)</button><button type="button" class="btn btn-secondary btn-sm" data-cfg="import">Importar backup</button><input type="file" id="cfgImportFile" accept="application/json,.json" hidden></div>
           <div class="flex flex-wrap mt8"><button type="button" class="btn btn-secondary btn-sm" data-cfg="restore" ${snap ? '' : 'disabled'}>Restaurar último snapshot</button><button type="button" class="btn btn-danger btn-sm" data-cfg="wipe">Apagar todos os dados</button></div>
@@ -2434,6 +2907,8 @@ const ConfigView = {
         const pin = await Modal.prompt({ titulo: 'Apagar todos os dados', tipo: 'password', placeholder: 'PIN', mensagem: '<b>Esta ação é irreversível.</b> Formulários, logs, rascunhos, anexos e configurações serão apagados deste navegador. Exporte um backup antes.<br><br>Digite o PIN de administrador para confirmar:' });
         if (pin === null) return;
         if (String(pin) !== String(Store.settings.adminPin)) { Toast.show('PIN incorreto.', 'error'); return; }
+        // Na nuvem a base é da equipe: o botão limpa este navegador, não o servidor.
+        if (SB.ativo()) { Toast.show('A base agora é compartilhada — apagar tudo afetaria a equipe inteira. Isso se faz pelo painel do Supabase.', 'warn', 7000); break; }
         App.wiping = true; try { await AttachmentStore.clear(); } catch (err) { /* ignora */ } Adapter.clearAll(); localStorage.removeItem(Backup._key); sessionStorage.clear(); location.reload(); break;
       }
     }
@@ -2446,10 +2921,15 @@ const ConfigView = {
 const App = {
   wiping: false,
   async init() {
+    Modal.init(); VizTip.init();
+    // Na nuvem a autenticação vem antes de qualquer leitura: sem sessão, o
+    // banco não devolve uma linha sequer (é a RLS trabalhando, não um bug).
+    const jaTinha = await Session.init();
+    if (!jaTinha) await LoginView.show();
     await Store.init();
     await AttachmentStore.init();
-    Modal.init(); VizTip.init();
-    if (!Session.init()) await LoginView.show();
+    if (!jaTinha) await Session.registrarEntrada();
+    Sync.start();
     Presence.start(); UserChip.init(); PresenceWidget.init();
     FormView.init(); DashboardView.init(); LogsView.init(); ReportsView.init(); ConfigView.init();
     Nav.init({ formularios: FormView, dashboard: DashboardView, logs: LogsView, relatorios: ReportsView, configuracoes: ConfigView });
