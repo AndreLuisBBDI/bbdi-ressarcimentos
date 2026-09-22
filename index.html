@@ -796,6 +796,11 @@ const SB = {
     });
     return this._cli;
   },
+  /** A linha de ressarc_presence no formato que o Presence espera. */
+  presencaDaLinha(r) {
+    const t = new Date(r.visto_em).getTime();
+    return { usuarioId: r.slug || r.usuario, nome: r.nome, setor: r.setor, lastSeen: t, lastActive: t };
+  },
   /** Traduz o erro do PostgREST para algo que o operador entenda. */
   erro(e, onde) {
     const msg = String((e && (e.message || e.error_description)) || e || '');
@@ -920,10 +925,7 @@ const SupabaseAdapter = {
         const corte = new Date(Date.now() - 120000).toISOString();
         const { data, error } = await cli.from('ressarc_presence').select('*').gte('visto_em', corte);
         if (error) throw SB.erro(error, 'presença');
-        const o = {}; (data || []).forEach(r => {
-          const t = new Date(r.visto_em).getTime();
-          o[r.usuario] = { usuarioId: r.slug || r.usuario, nome: r.nome, setor: r.setor, lastSeen: t, lastActive: t };
-        });
+        const o = {}; (data || []).forEach(r => { o[r.usuario] = SB.presencaDaLinha(r); });
         return o;
       }
       // A fila de envio é do dispositivo, não da equipe: continua local.
@@ -1355,18 +1357,53 @@ const SubmissionQueue = {
 };
 
 /** Presença em tempo real. Local: heartbeat no localStorage (abas do mesmo navegador) + usuários simulados.
- *  Online: substituir por sessões do servidor (WebSocket/SSE) mantendo `listar()` com o mesmo formato. */
+ *  Na nuvem: o WebSocket do Supabase empurra cada entrada e cada saída, e o heartbeat só sustenta o TTL. */
 const Presence = {
-  INTERVALO: 5000, TTL_ONLINE: 20000, TTL_ATIVO: 60000,
+  INTERVALO: 5000, TTL_ONLINE: 20000, TTL_ATIVO: 60000, RECONCILIAR: 60000,
   _timer: null, _ultimaAtividade: Date.now(), _simulados: {}, _seeded: false,
+  _canal: null, _cache: null, _aoVivo: false, _reconciliadoEm: 0, _avisoAgendado: null,
   start() {
     this._simular();
+    this._assinar();
     this.heartbeat().then(() => Bus.emit('presence:changed'));
     this._timer = setInterval(() => this.tick(), this.INTERVALO);
     ['click', 'keydown', 'input', 'pointerdown'].forEach(ev => document.addEventListener(ev, () => { this._ultimaAtividade = Date.now(); }, { passive: true }));
   },
+  /** Push de verdade: o banco avisa a chegada e a saída no instante em que acontecem.
+   *  O heartbeat continua porque é ele que derruba quem fecha o notebook sem se despedir. */
+  _assinar() {
+    if (this._canal || !SB.ativo()) return;
+    try {
+      this._canal = SB.cli().channel('ressarc-presenca')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'ressarc_presence' }, p => this._aplicar(p))
+        .subscribe(st => {
+          this._aoVivo = st === 'SUBSCRIBED';
+          if (this._aoVivo) this._sincronizar().catch(() => {});
+          else this._cache = null;              // sem push, volta a ler o banco a cada tick
+          console.info('[presence] canal:', st);
+          Bus.emit('presence:changed');
+        });
+    } catch (e) {
+      console.warn('[presence] tempo real indisponível; seguindo por leitura periódica', e);
+      this._canal = null; this._aoVivo = false;
+    }
+  },
+  _aplicar(p) {
+    if (!this._cache) this._cache = {};
+    if (p.eventType === 'DELETE') { const id = p.old && p.old.usuario; if (id) delete this._cache[id]; }
+    else if (p.new && p.new.usuario) this._cache[p.new.usuario] = SB.presencaDaLinha(p.new);
+    if (this._avisoAgendado) return;            // rajada de heartbeats alheios vira um render só
+    this._avisoAgendado = setTimeout(() => { this._avisoAgendado = null; Bus.emit('presence:changed'); }, 250);
+  },
+  /** Evento perdido existe (aba dormindo, rede caindo): de tempos em tempos o cache é refeito do banco. */
+  async _sincronizar() {
+    this._cache = await Adapter.readAll('presence', {});
+    this._reconciliadoEm = Date.now();
+  },
   stop() {
     clearInterval(this._timer);
+    if (this._avisoAgendado) { clearTimeout(this._avisoAgendado); this._avisoAgendado = null; }
+    if (this._canal) { try { SB.cli().removeChannel(this._canal); } catch (e) { /* ignora */ } this._canal = null; this._aoVivo = false; this._cache = null; }
     const s = Session.atual; if (!s) return;
     if (SB.ativo()) { this._beaconSaida(); return; }
     try { const obj = LocalAdapter._read('presence') || {}; delete obj[s.sessionId]; LocalAdapter._write('presence', obj); } catch (e) { /* ignora */ }
@@ -1395,7 +1432,12 @@ const Presence = {
     const s = Session.atual; if (!s) return;
     await Adapter.writeKey('presence', s.sessionId, { usuarioId: s.usuarioId, nome: s.nome, setor: s.setor, lastSeen: Date.now(), lastActive: this._ultimaAtividade });
   },
-  async tick() { await this.heartbeat(); await this._limpar(); this._simular(); Bus.emit('presence:changed'); },
+  async tick() {
+    await this.heartbeat();
+    if (this._aoVivo) { if (Date.now() - this._reconciliadoEm > this.RECONCILIAR) await this._sincronizar().catch(() => {}); }
+    else await this._limpar();
+    this._simular(); Bus.emit('presence:changed');
+  },
   async _limpar() {
     const all = await Adapter.readAll('presence', {}); let mudou = false;
     for (const [k, v] of Object.entries(all)) if (Date.now() - (v.lastSeen || 0) > this.TTL_ONLINE) { delete all[k]; mudou = true; }
@@ -1416,7 +1458,7 @@ const Presence = {
   },
   async listar() {
     const agora = Date.now();
-    const pres = await Adapter.readAll('presence', {});
+    const pres = this._aoVivo && this._cache ? this._cache : await Adapter.readAll('presence', {});
     const porUsuario = new Map();
     for (const v of Object.values(pres)) {
       if (agora - (v.lastSeen || 0) > this.TTL_ONLINE) continue;
@@ -2544,7 +2586,7 @@ const PresenceWidget = {
     if (!this.aberto) return;
     document.getElementById('presencePanel').innerHTML = `<div class="presence-head"><span>Usuários online</span><span class="badge Finalizado">${online.length} de ${lista.length}</span></div>
       <div class="presence-list">${lista.map(u => `<div class="presence-item ${u.online ? (u.ativoAgora ? 'online' : 'inativo') : ''}"><span class="status" title="${u.online ? 'online' : 'offline'}"></span><span class="avatar" style="background:${u.online ? 'var(--brand-100)' : 'var(--surface-3)'};color:var(--brand-700)">${U.esc(U.iniciais(u.nome))}</span><span class="grow"><div class="nome">${U.esc(u.nome)}${u.eu ? ' <span class="muted small">(você)</span>' : ''} <span class="sector ${U.esc(u.setor)}" style="color:#fff">${U.esc(u.setor)}</span></div><div class="sub">${u.online ? (u.ativoAgora ? 'ativo agora' : 'inativo · última atividade ' + U.fmtRelativo(Date.now() - u.lastActive)) + (u.sessoes > 1 ? ` · ${u.sessoes} sessões` : '') + (u.simulado ? ' · simulado' : '') : 'offline'}</div></span></div>`).join('')}</div>
-      <div class="presence-foot">Atualização a cada 5 s · ${Store.settings.simularPresenca ? 'inclui usuários simulados (versão local)' : 'somente sessões reais deste navegador'}</div>`;
+      <div class="presence-foot">${Presence._aoVivo ? 'Tempo real · entra e sai na hora' : 'Atualização a cada 5 s'} · ${Store.settings.simularPresenca ? 'inclui usuários simulados (versão local)' : (SB.ativo() ? 'sessões reais de toda a equipe' : 'somente sessões reais deste navegador')}</div>`;
   },
 };
 
