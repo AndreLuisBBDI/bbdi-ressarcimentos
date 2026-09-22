@@ -17,11 +17,13 @@ begin
                     and tablename  = 'ressarc_presence') then
     execute 'alter publication supabase_realtime add table public.ressarc_presence';
   end if;
-  -- DELETE em tabela com RLS só é publicado com a linha antiga inteira: o
-  -- Realtime precisa dela para decidir se o assinante podia ver aquela linha.
-  -- Com replica identity default (a PK) o evento é engolido em silêncio e
-  -- quem sai do site só some 20 s depois, pelo TTL. Medido em 22/09/2026.
-  execute 'alter table public.ressarc_presence replica identity full';
+  -- NÃO ponha esta tabela em replica identity full. Testado em 22/09/2026:
+  -- com full, o Realtime passa a avaliar a RLS linha a linha e cada pessoa
+  -- só recebe o evento da própria linha — ninguém vê ninguém entrar. Com a
+  -- identidade default os eventos de todos chegam em ~1,5 s. O preço é que
+  -- o DELETE não é publicado, e por isso o cliente sai por UPDATE
+  -- (visto_em jogado para trás) em vez de apagar a linha.
+  execute 'alter table public.ressarc_presence replica identity default';
 end $$;
 
 -- A política p_presence_sel (ressarc_sou_ativo()) vale também para o

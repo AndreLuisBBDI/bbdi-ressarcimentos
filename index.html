@@ -922,7 +922,7 @@ const SupabaseAdapter = {
         const o = {}; (data || []).forEach(r => { o[r.ano] = r.valor; }); return o;
       }
       case 'presence': {
-        const corte = new Date(Date.now() - 120000).toISOString();
+        const corte = new Date(Date.now() - 180000).toISOString();   // > TTL_ONLINE
         const { data, error } = await cli.from('ressarc_presence').select('*').gte('visto_em', corte);
         if (error) throw SB.erro(error, 'presença');
         const o = {}; (data || []).forEach(r => { o[r.usuario] = SB.presencaDaLinha(r); });
@@ -1008,7 +1008,15 @@ const SupabaseAdapter = {
       if (error) throw SB.erro(error, 'apagar rascunho');
       return {};
     }
-    if (col === 'presence') { await SB.cli().from('ressarc_presence').delete().eq('usuario', Session.authId); return {}; }
+    // Sair é um UPDATE, não um DELETE: o Postgres não publica o DELETE desta
+    // tabela (RLS com replica identity default), e o colega continuaria vendo
+    // você online até o TTL vencer. Medido em 22/09/2026.
+    if (col === 'presence') {
+      await SB.cli().from('ressarc_presence')
+        .update({ visto_em: new Date(Date.now() - 3600000).toISOString() })
+        .eq('usuario', Session.authId);
+      return {};
+    }
     if (col === 'outbox') return LocalAdapter.removeKey(col, key);
     return {};
   },
@@ -1359,7 +1367,10 @@ const SubmissionQueue = {
 /** Presença em tempo real. Local: heartbeat no localStorage (abas do mesmo navegador) + usuários simulados.
  *  Na nuvem: o WebSocket do Supabase empurra cada entrada e cada saída, e o heartbeat só sustenta o TTL. */
 const Presence = {
-  INTERVALO: 5000, TTL_ONLINE: 20000, TTL_ATIVO: 60000, RECONCILIAR: 60000,
+  // O Chrome estrangula o timer de aba em segundo plano para cerca de um disparo
+  // por minuto. Com TTL de 20 s quem deixava o site aberto numa aba de trás
+  // aparecia e sumia da lista dos outros. O TTL agora cabe o pior caso medido.
+  INTERVALO: 20000, TTL_ONLINE: 150000, TTL_ATIVO: 90000, RECONCILIAR: 120000,
   _timer: null, _ultimaAtividade: Date.now(), _simulados: {}, _seeded: false,
   _canal: null, _cache: null, _aoVivo: false, _reconciliadoEm: 0, _avisoAgendado: null,
   start() {
@@ -1422,7 +1433,7 @@ const Presence = {
     try { const obj = LocalAdapter._read('presence') || {}; delete obj[s.sessionId]; LocalAdapter._write('presence', obj); } catch (e) { /* ignora */ }
   },
   /** No 'pagehide' não há tempo para uma promessa: keepalive entrega mesmo com a aba fechando.
-   *  Se falhar, não há perda — a leitura já descarta presença com mais de 2 min. */
+   *  Se falhar, não há perda — a leitura já descarta presença velha. */
   _beaconSaida() {
     try {
       const tok = SB._cli && SB._cli.auth && SB._cli.auth.currentSession ? SB._cli.auth.currentSession.access_token : null;
@@ -1430,8 +1441,10 @@ const Presence = {
       const jwt = tok || (raw ? (JSON.parse(raw).access_token || null) : null);
       if (!jwt || !Session.authId) return;
       fetch(`${NUVEM.url}/rest/v1/ressarc_presence?usuario=eq.${Session.authId}`, {
-        method: 'DELETE', keepalive: true,
-        headers: { apikey: NUVEM.anonKey, Authorization: 'Bearer ' + jwt },
+        method: 'PATCH', keepalive: true,
+        headers: { apikey: NUVEM.anonKey, Authorization: 'Bearer ' + jwt,
+                   'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ visto_em: new Date(Date.now() - 3600000).toISOString() }),
       }).catch(() => {});
     } catch (e) { /* ignora */ }
   },
@@ -2593,7 +2606,7 @@ const PresenceWidget = {
     if (!this.aberto) return;
     document.getElementById('presencePanel').innerHTML = `<div class="presence-head"><span>Usuários online</span><span class="badge Finalizado">${online.length} de ${lista.length}</span></div>
       <div class="presence-list">${lista.map(u => `<div class="presence-item ${u.online ? (u.ativoAgora ? 'online' : 'inativo') : ''}"><span class="status" title="${u.online ? 'online' : 'offline'}"></span><span class="avatar" style="background:${u.online ? 'var(--brand-100)' : 'var(--surface-3)'};color:var(--brand-700)">${U.esc(U.iniciais(u.nome))}</span><span class="grow"><div class="nome">${U.esc(u.nome)}${u.eu ? ' <span class="muted small">(você)</span>' : ''} <span class="sector ${U.esc(u.setor)}" style="color:#fff">${U.esc(u.setor)}</span></div><div class="sub">${u.online ? (u.ativoAgora ? 'ativo agora' : 'inativo · última atividade ' + U.fmtRelativo(Date.now() - u.lastActive)) + (u.sessoes > 1 ? ` · ${u.sessoes} sessões` : '') + (u.simulado ? ' · simulado' : '') : 'offline'}</div></span></div>`).join('')}</div>
-      <div class="presence-foot">${Presence._aoVivo ? 'Tempo real · entra e sai na hora' : 'Atualização a cada 5 s'} · ${Store.settings.simularPresenca ? 'inclui usuários simulados (versão local)' : (SB.ativo() ? 'sessões reais de toda a equipe' : 'somente sessões reais deste navegador')}</div>`;
+      <div class="presence-foot">${Presence._aoVivo ? 'Tempo real · entra e sai na hora' : 'Atualização a cada ' + Math.round(Presence.INTERVALO / 1000) + ' s'} · ${Store.settings.simularPresenca ? 'inclui usuários simulados (versão local)' : (SB.ativo() ? 'sessões reais de toda a equipe' : 'somente sessões reais deste navegador')}</div>`;
   },
 };
 
