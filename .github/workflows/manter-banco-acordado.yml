@@ -1,0 +1,51 @@
+name: Manter o banco acordado
+
+# O plano Free do Supabase pausa o projeto que passa uma semana sem consulta de
+# usuário. Aconteceu em 28/09/2026: nenhum formulário desde a migração de 22/09,
+# o projeto pausou, o endereço do banco sumiu do DNS e o site abria só o
+# cabeçalho. A documentação pede algumas requisições por dia; uma rodada diária
+# com cinco consultas cobre isso. Se o projeto pausar mesmo assim, este job falha
+# e o GitHub avisa por e-mail, então ele também serve de alarme.
+
+on:
+  schedule:
+    - cron: '37 10 * * *'   # 07:37 em Brasília, todo dia
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # só o último passo usa
+
+jobs:
+  consultar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Consulta o banco
+        run: |
+          # URL e chave saem do NUVEM do index.html: fonte única, acompanha troca de chave.
+          URL=$(grep -o "url: 'https://[a-z0-9]*\.supabase\.co'" index.html | head -1 | cut -d"'" -f2)
+          KEY=$(grep -o "anonKey: '[^']*'" index.html | head -1 | cut -d"'" -f2)
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then
+            echo "::error::NUVEM.url ou NUVEM.anonKey não encontrado no index.html"
+            exit 1
+          fi
+          # O anon não lê tabela nenhuma do public (db/01-schema.sql revoga tudo).
+          # Listar os buckets do Storage roda uma consulta de verdade no Postgres,
+          # como anon, e volta [] pela RLS.
+          for i in 1 2 3 4 5; do
+            curl -sS --fail --retry 3 --retry-delay 20 --retry-all-errors -m 30 -o /dev/null \
+              -w "consulta $i: http %{http_code} em %{time_total}s\n" \
+              -H "apikey: $KEY" -H "Authorization: Bearer $KEY" "$URL/storage/v1/bucket"
+          done
+
+      - name: Impede o GitHub de desligar o agendamento
+        # Em repositório público o GitHub desliga o agendamento depois de 60 dias
+        # sem commit. Reativar o workflow pela API renova esse prazo.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$(basename "${GITHUB_WORKFLOW_REF%@*}")/enable"
+          echo "agendamento renovado"
