@@ -4,17 +4,23 @@ name: Manter o banco acordado
 # usuário. Aconteceu em 28/09/2026: nenhum formulário desde a migração de 22/09,
 # o projeto pausou, o endereço do banco sumiu do DNS e o site abria só o
 # cabeçalho. A documentação pede algumas requisições por dia; uma rodada diária
-# com cinco consultas cobre isso. Se o projeto pausar mesmo assim, este job falha
-# e o GitHub avisa por e-mail, então ele também serve de alarme.
+# com cinco consultas cobre isso. Se o projeto pausar mesmo assim, o job falha e
+# abre uma issue mencionando o dono do repositório, então ele também é o alarme.
 
 on:
   schedule:
     - cron: '37 10 * * *'   # 07:37 em Brasília, todo dia
   workflow_dispatch:
+    inputs:
+      testar_alarme:
+        description: 'Simular uma falha para conferir se a issue de alarme abre'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  actions: write   # só o último passo usa
+  actions: write   # renovar o agendamento
+  issues: write    # abrir o alarme
 
 jobs:
   consultar:
@@ -24,7 +30,13 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Consulta o banco
+        env:
+          TESTE: ${{ inputs.testar_alarme }}
         run: |
+          if [ "$TESTE" = "true" ]; then
+            echo "::error::falha simulada pelo testar_alarme"
+            exit 1
+          fi
           # URL e chave saem do NUVEM do index.html: fonte única, acompanha troca de chave.
           URL=$(grep -o "url: 'https://[a-z0-9]*\.supabase\.co'" index.html | head -1 | cut -d"'" -f2)
           KEY=$(grep -o "anonKey: '[^']*'" index.html | head -1 | cut -d"'" -f2)
@@ -49,3 +61,31 @@ jobs:
         run: |
           gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$(basename "${GITHUB_WORKFLOW_REF%@*}")/enable"
           echo "agendamento renovado"
+
+      - name: Abre o alarme
+        # O e-mail de falha do próprio GitHub vai para quem ativou o agendamento por
+        # último, e o passo acima o reativa como github-actions[bot]: esse e-mail
+        # pode não chegar a ninguém. A menção numa issue chega. Enquanto houver uma
+        # issue de alarme aberta, as falhas seguintes entram como comentário nela.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DONO: ${{ github.repository_owner }}
+          LOG: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TESTE: ${{ inputs.testar_alarme }}
+        run: |
+          TITULO="Alarme: o banco do Supabase não respondeu"
+          if [ "$TESTE" = "true" ]; then TITULO="$TITULO (teste)"; fi
+          REF=$(grep -o "url: 'https://[a-z0-9]*\.supabase\.co'" index.html 2>/dev/null | head -1 | cut -d/ -f3 | cut -d. -f1 || true)
+          CORPO="@$DONO o workflow que mantém o banco acordado falhou em $(TZ=America/Sao_Paulo date '+%d/%m/%Y às %H:%M').
+
+          Log: $LOG
+
+          Se a falha foi na consulta, o projeto do Supabase provavelmente pausou e o site abre só o cabeçalho. Para voltar: https://supabase.com/dashboard/project/$REF, botão **Resume project**. Leva uns 7 minutos. Feche esta issue quando resolver."
+          ABERTA=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --json number,title \
+            -q ".[] | select(.title == \"$TITULO\") | .number" | head -1)
+          if [ -n "$ABERTA" ]; then
+            gh issue comment "$ABERTA" -R "$GITHUB_REPOSITORY" --body "$CORPO"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$TITULO" --body "$CORPO"
+          fi
